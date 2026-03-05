@@ -263,9 +263,8 @@ function Get-InstalledNvidiaInfo {
 # -------------------------------------------------------------
 function Get-S3DriverInfo {
     param([string]$Bucket, [string]$Prefix)
-    Set-AwsCredentials
     try {
-        $exe = Get-S3Object -BucketName $Bucket -KeyPrefix $Prefix -ErrorAction Stop |
+        $exe = Get-S3Object -BucketName $Bucket -KeyPrefix $Prefix -Region "us-east-1" -ErrorAction Stop |
             Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
         if ($exe -and (Split-Path $exe.Key -Leaf) -match '(\d+\.\d+)') {
             return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$Bucket }
