@@ -585,8 +585,27 @@ foreach ($dir in @($WorkDir,$TempDir)) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
-Set-AwsCredentials   # Must run before any S3 calls
 Show-Banner
+
+# ── Loading Prerequisites (spinner via background thread) ─────
+$stopFlag = [ref]$false
+$spinner = [System.Threading.Thread]::new([System.Threading.ThreadStart]{
+    $frames = [char[]]@('|','/','-','\')
+    $i = 0
+    while (-not $stopFlag.Value) {
+        [Console]::Write("`r  Loading Prerequisites... " + $frames[$i % 4] + " ")
+        [System.Threading.Thread]::Sleep(120)
+        $i++
+    }
+})
+$spinner.IsBackground = $true
+$spinner.Start()
+
+Set-AwsCredentials   # First load of AWS SDK DLLs takes ~30s
+
+$stopFlag.Value = $true
+$spinner.Join(500) | Out-Null
+Write-Host "`r  Loading Prerequisites... done.  " -ForegroundColor Green
 
 # ── Resume ────────────────────────────────────────────────────
 $existingState = Load-State
