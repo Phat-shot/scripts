@@ -587,24 +587,31 @@ foreach ($dir in @($WorkDir,$TempDir)) {
 
 Show-Banner
 
-# ── Loading Prerequisites (spinner via background thread) ─────
-$stopFlag = [ref]$false
-$spinner = [System.Threading.Thread]::new([System.Threading.ThreadStart]{
-    $frames = [char[]]@('|','/','-','\')
+# ── Loading Prerequisites (spinner via runspace) ─────────────
+$stopFlag = [System.Collections.Generic.List[bool]]::new()
+$stopFlag.Add($false)
+$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+$rs.Open()
+$rs.SessionStateProxy.SetVariable('stopFlag', $stopFlag)
+$ps = [System.Management.Automation.PowerShell]::Create()
+$ps.Runspace = $rs
+$ps.AddScript({
+    $frames = @('|','/','-','\')
     $i = 0
-    while (-not $stopFlag.Value) {
+    while (-not $stopFlag[0]) {
         [Console]::Write("`r  Loading Prerequisites... " + $frames[$i % 4] + " ")
-        [System.Threading.Thread]::Sleep(120)
+        Start-Sleep -Milliseconds 120
         $i++
     }
-})
-$spinner.IsBackground = $true
-$spinner.Start()
+}) | Out-Null
+$handle = $ps.BeginInvoke()
 
 Set-AwsCredentials   # First load of AWS SDK DLLs takes ~30s
 
-$stopFlag.Value = $true
-$spinner.Join(500) | Out-Null
+$stopFlag[0] = $true
+Start-Sleep -Milliseconds 200
+$ps.EndInvoke($handle) | Out-Null
+$ps.Dispose(); $rs.Close()
 Write-Host "`r  Loading Prerequisites... done.  " -ForegroundColor Green
 
 # ── Resume ────────────────────────────────────────────────────
