@@ -690,7 +690,7 @@ function Invoke-FullInstall {
     $state.S3Key         = $S3Key
 
     # ── STEP 0: PRE-FLIGHT + DOWNLOAD ───────────────────────
-    if ($state.Step -notin @("AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")) {
+    if ($state.Step -notin @("AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")) # includes FRESH and empty {
         Write-Host ""
         Write-Host "  Step 1 / 4  --  Pre-flight check & Download" -ForegroundColor White
 
@@ -854,7 +854,7 @@ Show-Banner
 
 # ── Resume from saved state (post-reboot or manual -Resume) ──
 $existingState = Load-State
-if ($existingState -and ($Resume -or ($existingState.Step -in @("AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")))) {
+if ($existingState -and ($Resume -or ($existingState.Step -in @("FRESH", "AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")))) {
     Write-Host "  Resuming from saved step: " -NoNewline -ForegroundColor Yellow
     Write-Host $existingState.Step -ForegroundColor White
     Write-Log "Resuming from step: $($existingState.Step)"
@@ -898,7 +898,7 @@ if (-not $info.Installed) {
     Write-Host "  No NVIDIA driver installed." -ForegroundColor Yellow
     $variant    = if (Prompt-YesNo "Install GRID / Enterprise driver? (No = Gaming)") { "GRID" } else { "Gaming" }
     $latestInfo = if ($variant -eq "GRID") { Get-LatestGridVersion -GpuName "" } else { Get-LatestGamingVersion -GpuName "" }
-    Save-State @{ Step="AFTER_REGISTRY"; TargetVariant=$variant; TargetVersion=$latestInfo.Version; S3Bucket=$latestInfo.S3Bucket; S3Key=$latestInfo.S3Key }
+    Save-State @{ Step="FRESH"; TargetVariant=$variant; TargetVersion=$latestInfo.Version; S3Bucket=$latestInfo.S3Bucket; S3Key=$latestInfo.S3Key }
     Invoke-FullInstall -TargetVariant $variant -Version $latestInfo.Version -S3Bucket $latestInfo.S3Bucket -S3Key $latestInfo.S3Key
     exit 0
 }
@@ -911,25 +911,25 @@ switch -Wildcard ($action) {
     "*Update driver*" {
         $latest = if ($info.Variant -eq "GRID") { $online.LatestGrid } else { $online.LatestGaming }
         $v      = $latest.Version
-        Save-State @{ Step="AFTER_REGISTRY"; TargetVariant=$info.Variant; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
+        Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
         Invoke-FullInstall -TargetVariant $info.Variant -Version $v -S3Bucket $latest.S3Bucket -S3Key $latest.S3Key
     }
     "*GRID*" {
         $latest = $online.LatestGrid
         $v      = $latest.Version
-        Save-State @{ Step="AFTER_REGISTRY"; TargetVariant="GRID"; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
+        Save-State @{ Step="FRESH"; TargetVariant="GRID"; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
         Invoke-FullInstall -TargetVariant "GRID" -Version $v -S3Bucket $latest.S3Bucket -S3Key $latest.S3Key
     }
     "*Gaming*" {
         $latest = $online.LatestGaming
         $v      = $latest.Version
-        Save-State @{ Step="AFTER_REGISTRY"; TargetVariant="Gaming"; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
+        Save-State @{ Step="FRESH"; TargetVariant="Gaming"; TargetVersion=$v; S3Bucket=$latest.S3Bucket; S3Key=$latest.S3Key }
         Invoke-FullInstall -TargetVariant "Gaming" -Version $v -S3Bucket $latest.S3Bucket -S3Key $latest.S3Key
     }
     "*Reinstall*" {
         # Reinstall: re-fetch S3 key for current variant
         $latestInfo = if ($info.Variant -eq "GRID") { Get-LatestGridVersion -GpuName $info.GpuName } else { Get-LatestGamingVersion -GpuName $info.GpuName }
-        Save-State @{ Step="AFTER_REGISTRY"; TargetVariant=$info.Variant; TargetVersion=$info.Version; S3Bucket=$latestInfo.S3Bucket; S3Key=$latestInfo.S3Key }
+        Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$info.Version; S3Bucket=$latestInfo.S3Bucket; S3Key=$latestInfo.S3Key }
         Invoke-FullInstall -TargetVariant $info.Variant -Version $info.Version -S3Bucket $latestInfo.S3Bucket -S3Key $latestInfo.S3Key
     }
     "*Virtual Display*" {
