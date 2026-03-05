@@ -221,11 +221,8 @@ function Get-InstalledNvidiaInfo {
 # ─────────────────────────────────────────────────────────────
 function Get-LatestGamingVersion {
     param([string]$GpuName)
-    # Data Center GPUs don't have Gaming/GeForce drivers
-    if ($GpuName -match "L4|L40|A100|H100|T4|V100|A40") {
-        return @{ Version = "N/A (Data Center GPU)"; S3Key = ""; S3Bucket = "" }
-    }
     # Official AWS method: s3://nvidia-gaming/windows/latest/
+    # Supported hardware: NVIDIA L4, L40S, A10G, T4, M60 (per AWS docs)
     # Requires AmazonS3ReadOnlyAccess + nvidia-gaming bucket access (G4dn/G5 only)
     try {
         if (-not (Get-Command Get-S3Object -ErrorAction SilentlyContinue)) { throw "No AWS Tools" }
@@ -586,7 +583,8 @@ function Step-CheckOnline {
     $latestGrid   = Get-LatestGridVersion   -GpuName $info.GpuName
 
     Write-Host "  Installed     : $($info.Version)  [$($info.Variant)]" -ForegroundColor White
-    Write-Host "  Latest Gaming : $($latestGaming.Version)" -ForegroundColor Magenta
+    $gamingColor = if ($latestGaming.Version -eq "Unknown") { "DarkGray" } else { "Magenta" }
+    Write-Host "  Latest Gaming : $($latestGaming.Version)" -ForegroundColor $gamingColor
     Write-Host "  Latest GRID   : $($latestGrid.Version)"   -ForegroundColor Blue
     Write-Host ""
 
