@@ -867,11 +867,27 @@ if ($existingState -and ($Resume -or ($existingState.Step -in @("AFTER_DOWNLOAD"
         Write-Host "  No driver currently detected." -ForegroundColor DarkGray
     }
     Write-Host ""
+    # If S3 info missing from old state, re-fetch
+    $resumeS3Bucket = $existingState.S3Bucket
+    $resumeS3Key    = $existingState.S3Key
+    if (-not $resumeS3Bucket -or -not $resumeS3Key) {
+        Write-Host "  S3 info missing from state -- re-fetching..." -ForegroundColor Yellow
+        $refetch = if ($existingState.TargetVariant -eq "GRID") {
+            Get-LatestGridVersion -GpuName $cur.GpuName
+        } else {
+            Get-LatestGamingVersion -GpuName $cur.GpuName
+        }
+        $resumeS3Bucket = $refetch.S3Bucket
+        $resumeS3Key    = $refetch.S3Key
+        if (-not $existingState.TargetVersion) {
+            $existingState.TargetVersion = $refetch.Version
+        }
+    }
     Invoke-FullInstall `
         -TargetVariant $existingState.TargetVariant `
         -Version       $existingState.TargetVersion `
-        -S3Bucket      $existingState.S3Bucket `
-        -S3Key         $existingState.S3Key
+        -S3Bucket      $resumeS3Bucket `
+        -S3Key         $resumeS3Key
     exit 0
 }
 
