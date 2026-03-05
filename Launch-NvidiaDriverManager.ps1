@@ -67,7 +67,8 @@ Write-Host ""
 Write-Host "  Launching Driver Manager..." -ForegroundColor Cyan
 Write-Host ""
 
-# Launch in a new PowerShell process with Bypass policy
-# (required when running from a compiled EXE via ps2exe)
+# Launch in a new visible PowerShell window with Bypass policy
 $argStr = ($args | ForEach-Object { $_ }) -join " "
-Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" -Wait
+Start-Process powershell.exe `
+    -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" `
+    -Verb RunAs
