@@ -883,6 +883,16 @@ foreach ($dir in @($WorkDir, $TempDir)) {
 
 Show-Banner
 
+# ── AWS Credentials -- load profile globally for all S3 operations ──
+if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
+    try {
+        Set-AWSCredential -ProfileName default -ErrorAction Stop
+        Write-Log "AWS credentials loaded (profile: default)" -Level "OK"
+    } catch {
+        Write-Log "AWS profile 'default' not found -- using IAM role or env vars" -Level "WARN"
+    }
+}
+
 # ── Resume from saved state (post-reboot or manual -Resume) ──
 $existingState = Load-State
 if ($existingState -and ($Resume -or ($existingState.Step -in @("FRESH", "AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")))) {
