@@ -249,7 +249,7 @@ function Get-LatestGamingVersion {
     # Requires AmazonS3ReadOnlyAccess + nvidia-gaming bucket access (G4dn/G5 only)
     try {
         if (-not (Get-Command Get-S3Object -ErrorAction SilentlyContinue)) { throw "No AWS Tools" }
-        Set-AWSCredential -ProfileName default -ErrorAction SilentlyContinue
+        Set-AWSCredential -ProfileName default -ProfileLocation "$env:USERPROFILE\.aws\credentials" -ErrorAction SilentlyContinue
         $objects = Get-S3Object -BucketName "nvidia-gaming" -KeyPrefix "windows/latest/" -Region "us-east-1" -ErrorAction Stop
         $exe = $objects | Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
         if ($exe) {
@@ -270,7 +270,7 @@ function Get-LatestGridVersion {
     # Bucket: ec2-windows-nvidia-drivers, prefix: latest/
     # Requires AmazonS3ReadOnlyAccess IAM policy on the instance
     try {
-        Set-AWSCredential -ProfileName default -ErrorAction SilentlyContinue
+        Set-AWSCredential -ProfileName default -ProfileLocation "$env:USERPROFILE\.aws\credentials" -ErrorAction SilentlyContinue
         $objects = Get-S3Object -BucketName "ec2-windows-nvidia-drivers" -KeyPrefix "latest/" -Region "us-east-1" -ErrorAction Stop
         $exe = $objects | Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
         if ($exe) {
@@ -435,7 +435,7 @@ function Get-DriverPackage {
                 throw "AWS Tools for PowerShell not installed. Run: Install-Module -Name AWSPowerShell -Force"
             }
             # Ensure credentials are loaded
-            Set-AWSCredential -ProfileName default -ErrorAction SilentlyContinue
+            Set-AWSCredential -ProfileName default -ProfileLocation "$env:USERPROFILE\.aws\credentials" -ErrorAction SilentlyContinue
             Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $dest -Region "us-east-1" -ErrorAction Stop
             Write-Log "S3 download complete: $dest" -Level "OK"
             return $dest
@@ -710,7 +710,7 @@ function Invoke-FullInstall {
 
         # Load AWS credentials from profile (required in new PS sessions)
         try {
-            Set-AWSCredential -ProfileName default -ErrorAction Stop
+            Set-AWSCredential -ProfileName default -ProfileLocation "$env:USERPROFILE\.aws\credentials" -ErrorAction Stop
             Write-Host "  [OK] AWS credentials loaded (profile: default)" -ForegroundColor Green
             Write-Log "AWS credentials loaded from profile: default" -Level "OK"
         } catch {
@@ -887,7 +887,7 @@ foreach ($dir in @($WorkDir, $TempDir)) {
 # Must happen before Show-Banner and any S3 calls (including online version check)
 if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
     try {
-        Set-AWSCredential -ProfileName default -ErrorAction Stop
+        Set-AWSCredential -ProfileName default -ProfileLocation "$env:USERPROFILE\.aws\credentials" -ErrorAction Stop
     } catch {
         # No profile -- will use IAM role or env vars silently
     }
