@@ -432,6 +432,8 @@ function Get-DriverPackage {
             if (-not (Get-Command Get-S3Object -ErrorAction SilentlyContinue)) {
                 throw "AWS Tools for PowerShell not installed. Run: Install-Module -Name AWSPowerShell -Force"
             }
+            # Ensure credentials are loaded
+            Set-AWSCredential -ProfileName default -ErrorAction SilentlyContinue
             Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $dest -Region "us-east-1" -ErrorAction Stop
             Write-Log "S3 download complete: $dest" -Level "OK"
             return $dest
@@ -703,6 +705,17 @@ function Invoke-FullInstall {
             return
         }
         Write-Host "  [OK] AWS Tools available" -ForegroundColor Green
+
+        # Load AWS credentials from profile (required in new PS sessions)
+        try {
+            Set-AWSCredential -ProfileName default -ErrorAction Stop
+            Write-Host "  [OK] AWS credentials loaded (profile: default)" -ForegroundColor Green
+            Write-Log "AWS credentials loaded from profile: default" -Level "OK"
+        } catch {
+            Write-Host "  [WARN] Could not load AWS profile 'default': $_" -ForegroundColor Yellow
+            Write-Host "         Trying without explicit profile (IAM role or env vars)..." -ForegroundColor DarkGray
+            Write-Log "AWS profile load failed, continuing without explicit profile: $_" -Level "WARN"
+        }
 
         # Check disk space (need ~1.5 GB for driver)
         $drive = Split-Path $TempDir -Qualifier
