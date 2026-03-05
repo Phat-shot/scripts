@@ -717,7 +717,25 @@ function Invoke-FullInstall {
         # Download FIRST -- before any destructive steps
         Write-Host ""
         Write-Host "  Downloading driver before uninstall..." -ForegroundColor Cyan
-        $installerPath = Get-DriverPackage -Variant $TargetVariant -S3Bucket $S3Bucket -S3Key $S3Key
+
+        # If S3 info not passed in, fetch it now
+        $dlS3Bucket = $S3Bucket
+        $dlS3Key    = $S3Key
+        if (-not $dlS3Bucket -or -not $dlS3Key) {
+            Write-Host "  Fetching S3 download info..." -ForegroundColor Cyan
+            $s3Info = if ($TargetVariant -eq "GRID") {
+                Get-LatestGridVersion -GpuName ""
+            } else {
+                Get-LatestGamingVersion -GpuName ""
+            }
+            $dlS3Bucket = $s3Info.S3Bucket
+            $dlS3Key    = $s3Info.S3Key
+            # Update state with fetched info
+            $state.S3Bucket = $dlS3Bucket
+            $state.S3Key    = $dlS3Key
+        }
+
+        $installerPath = Get-DriverPackage -Variant $TargetVariant -S3Bucket $dlS3Bucket -S3Key $dlS3Key
         if (-not $installerPath -or -not (Test-Path $installerPath)) {
             Write-Host "  ERROR: Download failed. Aborting -- current driver untouched." -ForegroundColor Red
             Write-Log "Pre-flight failed: download failed" -Level "ERROR"
