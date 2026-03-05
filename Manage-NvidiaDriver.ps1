@@ -690,7 +690,7 @@ function Invoke-FullInstall {
     $state.S3Key         = $S3Key
 
     # ── STEP 0: PRE-FLIGHT + DOWNLOAD ───────────────────────
-    if ($state.Step -notin @("AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")) # includes FRESH and empty {
+    if ($state.Step -notin @("AFTER_DOWNLOAD", "AFTER_UNINSTALL", "AFTER_REGISTRY")) {
         Write-Host ""
         Write-Host "  Step 1 / 4  --  Pre-flight check & Download" -ForegroundColor White
 
