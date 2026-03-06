@@ -42,6 +42,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.ComponentModel;
 
 class Program {
     static int Main(string[] args) {
@@ -88,6 +89,7 @@ $compilerParams = New-Object System.CodeDom.Compiler.CompilerParameters
 $compilerParams.GenerateExecutable      = $true
 $compilerParams.OutputAssembly          = $OutExe
 $compilerParams.CompilerOptions         = "/target:exe /platform:x64 /win32manifest:`"$tempManifest`""
+$compilerParams.ReferencedAssemblies.Add("System.dll") | Out-Null
 
 if (Test-Path $IconPath) {
     $compilerParams.CompilerOptions    += " /win32icon:`"$IconPath`""
