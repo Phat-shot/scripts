@@ -72,12 +72,7 @@ Write-Host ""
 $isExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -notlike "*powershell*"
 if ($isExe) {
     $argStr = ($args | ForEach-Object { $_ }) -join " "
-    $proc = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" -PassThru
-    # Hide the launcher window immediately
-    Add-Type -Name Win32 -Namespace Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' -ErrorAction SilentlyContinue
-    $hwnd = (Get-Process -Id $PID).MainWindowHandle
-    [Native.Win32]::ShowWindow($hwnd, 0) | Out-Null
-    $proc.WaitForExit()
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" -Wait -NoNewWindow
 } else {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     & $ScriptDst @args
