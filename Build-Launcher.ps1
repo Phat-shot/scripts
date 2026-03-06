@@ -1,23 +1,22 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Compiles airgpu-driver-manager.exe using csc.exe (built into Windows .NET Framework).
-    No Visual Studio or additional tools required.
+    Compiles airgpu-driver-manager.exe -- self-contained launcher.
+    Downloads Manage-NvidiaDriver.ps1 from GitHub and runs it directly.
+    No separate PS1 launcher needed.
 #>
 
 $OutDir   = "C:\Program Files\airgpu"
 $OutExe   = "$OutDir\airgpu-driver-manager.exe"
 $IconPath = "$OutDir\airgpu.ico"
 
-# Find csc.exe from .NET Framework
+# Find csc.exe
 $csc = Get-ChildItem "C:\Windows\Microsoft.NET\Framework64" -Filter "csc.exe" -Recurse -ErrorAction SilentlyContinue |
        Sort-Object FullName -Descending | Select-Object -First 1
-
-if (-not $csc) {
-    Write-Host "  ERROR: csc.exe not found. Is .NET Framework installed?" -ForegroundColor Red
-    exit 1
-}
+if (-not $csc) { Write-Host "  ERROR: csc.exe not found." -ForegroundColor Red; exit 1 }
 Write-Host "  Using: $($csc.FullName)" -ForegroundColor DarkGray
+
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 
 # Write manifest
 $tempManifest = "$env:TEMP\airgpu.manifest"
@@ -47,32 +46,80 @@ $tempCs = "$env:TEMP\airgpu_launcher.cs"
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Reflection;
 
 class Program {
-    static int Main(string[] args) {
-        string exeDir  = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-        string ps1Path = Path.Combine(exeDir, "Driver Manager", "Launch-NvidiaDriverManager.ps1");
+    const string RawUrl  = "https://raw.githubusercontent.com/Phat-shot/scripts/main/Manage-NvidiaDriver.ps1";
+    const string WorkDir = @"C:\Program Files\airgpu\Driver Manager";
+    const string ScriptName = "Manage-NvidiaDriver.ps1";
 
-        if (!File.Exists(ps1Path)) {
+    static int Main(string[] args) {
+        string scriptPath = Path.Combine(WorkDir, ScriptName);
+
+        // Ensure working directory exists
+        if (!Directory.Exists(WorkDir))
+            Directory.CreateDirectory(WorkDir);
+
+        // Banner
+        Console.Clear();
+        Console.ForegroundColor = ConsoleColor.White;
+        Console.WriteLine("");
+        Console.WriteLine("     ___________       _                   ");
+        Console.WriteLine("    |           |   __ (_) _ __  __ _  _ __ ");
+        Console.WriteLine("    |  _______  |  / _` || || '__|/ _` || '_ \\");
+        Console.WriteLine("    | |       | | | (_| || || |  | (_| || |_) |");
+        Console.WriteLine("    | |_______| |  \\__,_||_||_|   \\__, || .__/");
+        Console.WriteLine("    |___________|                  |___/ |_|  ");
+        Console.WriteLine("");
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.WriteLine("                  D R I V E R   M A N A G E R");
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("                  NVIDIA  *  Amazon EC2  *  Windows 11");
+        Console.ResetColor();
+        Console.WriteLine("");
+
+        // Download latest script
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("  Fetching latest script from GitHub...");
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("  " + RawUrl);
+        Console.ResetColor();
+        Console.WriteLine("");
+
+        try {
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            using (var wc = new WebClient())
+                wc.DownloadFile(RawUrl, scriptPath);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("  Downloaded: " + scriptPath);
+            Console.ResetColor();
+        } catch (Exception ex) {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("  ERROR: Launcher script not found:");
-            Console.WriteLine("  " + ps1Path);
+            Console.WriteLine("  ERROR: Could not download script.");
+            Console.WriteLine("  " + ex.Message);
             Console.ResetColor();
             Console.WriteLine("\n  Press any key to exit...");
             Console.ReadKey();
             return 1;
         }
 
+        // Launch
+        Console.WriteLine("");
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("  Launching Driver Manager...");
+        Console.ResetColor();
+        Console.WriteLine("");
+
         string passArgs = args.Length > 0 ? string.Join(" ", args) : "";
         string psArgs   = string.Format(
             "-NoProfile -ExecutionPolicy Bypass -File \"{0}\" {1}",
-            ps1Path, passArgs).Trim();
+            scriptPath, passArgs).Trim();
 
         ProcessStartInfo psi = new ProcessStartInfo();
-        psi.FileName         = "powershell.exe";
-        psi.Arguments        = psArgs;
-        psi.UseShellExecute  = false;
+        psi.FileName        = "powershell.exe";
+        psi.Arguments       = psArgs;
+        psi.UseShellExecute = false;
 
         Process proc = Process.Start(psi);
         proc.WaitForExit();
@@ -81,12 +128,18 @@ class Program {
 }
 '@ | Set-Content $tempCs -Encoding UTF8
 
-# Build compile args
-$iconArg = if (Test-Path $IconPath) { "/win32icon:`"$IconPath`"" } else { "" }
-$args = "/target:exe /platform:x64 /out:`"$OutExe`" /win32manifest:`"$tempManifest`" $iconArg `"$tempCs`""
+# Compile
+$iconArg  = if (Test-Path $IconPath) { "/win32icon:`"$IconPath`"" } else { "" }
+$cscArgs  = @(
+    "/target:exe", "/platform:x64",
+    "/out:`"$OutExe`"",
+    "/win32manifest:`"$tempManifest`""
+)
+if ($iconArg) { $cscArgs += $iconArg }
+$cscArgs += "`"$tempCs`""
 
-Write-Host "  Compiling airgpu-driver-manager.exe..." -ForegroundColor Cyan
-$result = & $csc.FullName $args.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries) 2>&1
+Write-Host "  Compiling..." -ForegroundColor Cyan
+$result = & $csc.FullName $cscArgs 2>&1
 
 Remove-Item $tempManifest, $tempCs -Force -ErrorAction SilentlyContinue
 
