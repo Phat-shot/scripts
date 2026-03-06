@@ -246,12 +246,22 @@ function Get-InstalledNvidiaInfo {
         -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*NVIDIA*" } |
         ForEach-Object { $_.DisplayName }) -join " "
 
-    if     ($names -match "GRID|vGPU|Virtual GPU|Tesla|Enterprise")        { $info.Variant = "GRID" }
+    $vGaming = (Get-ItemProperty "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "vGamingMarketplace" -ErrorAction SilentlyContinue).vGamingMarketplace
+
+    if     ($vGaming -eq 2)                                                              { $info.Variant = "Gaming" }
+
+    elseif ($names -match "GRID|vGPU|Virtual GPU|Tesla|Enterprise")                     { $info.Variant = "GRID" }
     elseif ($names -match "GeForce|Game Ready|Gaming|Studio")               { $info.Variant = "Gaming" }
     elseif ($info.GpuName -match "Tesla|A10|A100|T4|V100|K80|A10G|L4|L40") { $info.Variant = "GRID" }
     else {
         $info.Variant = if (Get-ChildItem "$env:SystemRoot\System32\DriverStore\FileRepository" `
-            -Filter "nvgridsw*" -ErrorAction SilentlyContinue) { "GRID" } else { "Gaming" }
+            -Filter "nvgridswgame*" -ErrorAction SilentlyContinue) { "Gaming" }
+
+        elseif (Get-ChildItem "$env:SystemRoot\System32\DriverStore\FileRepository" `
+
+            -Filter "nvgridsw_aws*" -ErrorAction SilentlyContinue) { "GRID" }
+
+        else { "Unknown" }
     }
     return $info
 }
@@ -278,12 +288,12 @@ function Get-LatestGamingVersion {
 
 function Test-GamingDriverSupported {
     param([string]$GpuName)
-    # Gaming driver supported on: T4, A10G, L4 (exact), L40S
-    # NOT supported on fractal-gpu variants like L4f, L4s, etc.
-    if ($GpuName -match '(?i)\bT4\b')    { return $true }
-    if ($GpuName -match '(?i)\bA10G\b')  { return $true }
-    if ($GpuName -match '(?i)\bL40S\b')  { return $true }
-    if ($GpuName -match '(?i)\bL4\b' -and $GpuName -notmatch '(?i)\bL4[a-zA-Z]+\b') { return $true }
+    # Gaming driver supported on: T4 (G4dn), A10G (G5), L4 (G6), L40S (G6e)
+    # NOT supported on fractal variants: L4f, L4s etc. (G6f)
+    if ($GpuName -match '(?i)\bT4\b')                                             { return $true }
+    if ($GpuName -match '(?i)\bA10G\b')                                           { return $true }
+    if ($GpuName -match '(?i)\bL40S\b')                                           { return $true }
+    if ($GpuName -match '(?i)\bL4\b' -and $GpuName -notmatch '(?i)\bL4[a-z]+') { return $true }
     return $false
 }
 
