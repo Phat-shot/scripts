@@ -60,11 +60,15 @@ function Write-Status {
 # -------------------------------------------------------------
 function Set-AwsCredentials {
     if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
-        try {
-            Set-AWSCredential -ProfileName default -ProfileLocation $AwsCredsFile -ErrorAction Stop
-        } catch {
-            Write-Log "AWS profile 'default' not found at $AwsCredsFile -- trying IAM role/env vars" -Level "WARN"
+        if (Test-Path $AwsCredsFile) {
+            # Manual credentials file (no IAM role attached)
+            try {
+                Set-AWSCredential -ProfileName default -ProfileLocation $AwsCredsFile -ErrorAction Stop
+            } catch {
+                Write-Log "AWS credentials file found but could not be loaded: $_" -Level "WARN"
+            }
         }
+        # If no credentials file, SDK automatically uses IAM instance role -- no action needed
         Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
     }
 }
@@ -318,7 +322,7 @@ function Invoke-NvidiaUninstall {
                 if ($guid) { Start-Process msiexec.exe -ArgumentList "/x $guid /quiet /norestart" -Wait -NoNewWindow }
             } elseif ($app.UninstallString -match "\.exe") {
                 $exe = [regex]::Match($app.UninstallString, '"?([^"]+\.exe)"?').Groups[1].Value
-                if (Test-Path $exe) { Start-Process $exe -ArgumentList "-s -noreboot" -Wait -NoNewWindow }
+                if ($exe -and (Test-Path $exe)) { Start-Process $exe -ArgumentList "-s -noreboot" -Wait -NoNewWindow }
             }
         } catch { Write-Log "Failed to uninstall '$($app.DisplayName)': $_" -Level "WARN" }
     }
@@ -413,7 +417,7 @@ function Get-DriverPackage {
     Write-Status "  s3://$S3Bucket/$S3Key" "DarkGray"
     Set-AwsCredentials
     try {
-        Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $dest -ErrorAction Stop | Out-Null
+        Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $dest -Region "us-east-1" -ErrorAction Stop | Out-Null
         $sizeMB = [math]::Round((Get-Item $dest).Length / 1MB, 0)
         Write-Status "Download complete  ($sizeMB MB)" "Green"
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
