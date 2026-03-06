@@ -68,11 +68,16 @@ Write-Host "  Launching Driver Manager..." -ForegroundColor Cyan
 Write-Host ""
 
 # When running as a compiled EXE (ps2exe), & script.ps1 is blocked by ExecutionPolicy.
-# Detect this and spawn a real powershell.exe process instead.
+# Spawn a real powershell.exe and immediately hide this window.
 $isExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -notlike "*powershell*"
 if ($isExe) {
     $argStr = ($args | ForEach-Object { $_ }) -join " "
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" -Wait
+    $proc = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDst`" $argStr" -PassThru
+    # Hide the launcher window immediately
+    Add-Type -Name Win32 -Namespace Native -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' -ErrorAction SilentlyContinue
+    $hwnd = (Get-Process -Id $PID).MainWindowHandle
+    [Native.Win32]::ShowWindow($hwnd, 0) | Out-Null
+    $proc.WaitForExit()
 } else {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     & $ScriptDst @args
