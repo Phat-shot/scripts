@@ -63,36 +63,25 @@ class Program {
 
         // Banner
         Console.Clear();
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("   (  +-------+  )");
-        Console.WriteLine("  ( | +-----+ | )");
-        Console.Write(" (  | |     | |  )   "); Console.ForegroundColor = ConsoleColor.Cyan;    Console.WriteLine("AIRGPU");
-        Console.Write(" (  | |     | |  )   "); Console.ForegroundColor = ConsoleColor.DarkCyan; Console.WriteLine("DRIVER MANAGER");
-        Console.WriteLine(" (  | +-----+ | )");
-        Console.WriteLine("  (  +-------+  )");
-        Console.ResetColor();
-        Console.WriteLine("");
 
         // Skip download if state file exists (mid-install resume)
         string stateFile = Path.Combine(WorkDir, "state.json");
         bool hasState    = File.Exists(stateFile) && File.Exists(scriptPath);
 
-        if (hasState) {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("  Resuming from saved state...");
-            Console.ResetColor();
-        } else {
+        if (!hasState) {
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine("  Updating script...");
+            Console.Write("  Loading...");
             Console.ResetColor();
             try {
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                 using (var wc = new WebClient())
                     wc.DownloadFile(RawUrl, scriptPath);
+                Console.Write("\r           \r"); // clear line
             } catch (Exception ex) {
+                Console.WriteLine();
                 if (!File.Exists(scriptPath)) {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("  ERROR: Could not download script and no cached version found.");
+                    Console.WriteLine("  ERROR: Script not found and download failed.");
                     Console.WriteLine("  " + ex.Message);
                     Console.ResetColor();
                     Console.WriteLine("\n  Press any key to exit...");
@@ -104,13 +93,6 @@ class Program {
                 Console.ResetColor();
             }
         }
-
-        // Launch
-        Console.WriteLine("");
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("  Launching Driver Manager...");
-        Console.ResetColor();
-        Console.WriteLine("");
 
         string passArgs = args.Length > 0 ? string.Join(" ", args) : "";
         string psArgs   = string.Format(

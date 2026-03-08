@@ -103,28 +103,36 @@ function Write-ProgressBar {
 #  Uses SharedCredentialsFile explicitly to avoid conflict with
 #  empty NetSDKCredentialsFile profile of the same name.
 # -------------------------------------------------------------
+$script:AwsCredentialsLoaded = $false
 function Set-AwsCredentials {
-    if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
-        if (Test-Path $AwsCredsFile) {
-            try {
-                # Read key/secret directly from credentials file -- avoids parameter set ambiguity
-                $ini = Get-Content $AwsCredsFile | Where-Object { $_ -match '=' }
-                $kvp = @{}; $ini | ForEach-Object { $k,$v = $_ -split '\s*=\s*',2; $kvp[$k.Trim()] = $v.Trim() }
-                $key    = $kvp['aws_access_key_id']
-                $secret = $kvp['aws_secret_access_key']
-                if ($key -and $secret) {
-                    Set-AWSCredential -AccessKey $key -SecretKey $secret -StoreAs default -ErrorAction Stop
-                    Set-AWSCredential -ProfileName default -ErrorAction Stop
-                    Write-Log "AWS credentials loaded from file" -Level "INFO"
-                }
-            } catch {
-                Write-Log "AWS credentials file could not be loaded: $_" -Level "WARN"
+    if ($script:AwsCredentialsLoaded) { return }   # only run once per session
+    if (-not (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue)) { return }
+
+    if (Test-Path $AwsCredsFile) {
+        try {
+            $ini = Get-Content $AwsCredsFile | Where-Object { $_ -match '^\s*\w' -and $_ -match '=' }
+            $kvp = @{}
+            $ini | ForEach-Object {
+                $parts = $_ -split '\s*=\s*', 2
+                if ($parts.Count -eq 2) { $kvp[$parts[0].Trim()] = $parts[1].Trim() }
             }
-        } else {
-            Write-Log "No credentials file -- using IAM instance role" -Level "INFO"
+            $key    = $kvp['aws_access_key_id']
+            $secret = $kvp['aws_secret_access_key']
+            if ($key -and $secret) {
+                # Set session-scope credentials directly -- no profile store involved
+                Set-AWSCredential -AccessKey $key -SecretKey $secret -ErrorAction Stop
+                Write-Log "AWS credentials loaded from file (session scope)" -Level "INFO"
+            } else {
+                Write-Log "Credentials file found but key/secret missing -- falling back to IAM role" -Level "WARN"
+            }
+        } catch {
+            Write-Log "AWS credentials file error: $_" -Level "WARN"
         }
-        Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
+    } else {
+        Write-Log "No credentials file -- using IAM instance role" -Level "INFO"
     }
+    Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
+    $script:AwsCredentialsLoaded = $true
 }
 
 # -------------------------------------------------------------
@@ -191,16 +199,9 @@ function Register-ResumeOnBoot {
 #  UI HELPERS
 # -------------------------------------------------------------
 function Show-Banner {
-    Clear-Host
     Write-Host ""
-    Write-Host "    ___________  " -NoNewline -ForegroundColor White
-    Write-Host ""
-    Write-Host "   (  +-------+  )" -ForegroundColor Cyan
-    Write-Host "  ( | +-----+ | )" -ForegroundColor Cyan
-    Write-Host " (  | |     | |  )   AIRGPU" -ForegroundColor Cyan
-    Write-Host " (  | |     | |  )   DRIVER MANAGER" -ForegroundColor DarkCyan
-    Write-Host " (  | +-----+ | )" -ForegroundColor Cyan
-    Write-Host "  (  +-------+  )" -ForegroundColor Cyan
+    Write-Host "  AIRGPU " -NoNewline -ForegroundColor White
+    Write-Host "DRIVER MANAGER" -ForegroundColor DarkCyan
     Write-Host ""
 }
 
@@ -462,7 +463,6 @@ function Get-DriverPackage {
     }
 
     Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkGray
-    Set-AwsCredentials
     try {
         # Get file size for progress bar
         $meta  = Get-S3ObjectMetadata -BucketName $S3Bucket -Key $S3Key -Region "us-east-1" -ErrorAction SilentlyContinue
@@ -575,14 +575,13 @@ function Request-Reboot {
 function Step-ShowStatus {
     $info = Get-InstalledNvidiaInfo
     if (-not $info.Installed) {
-        Write-Host "  [!] No NVIDIA driver detected." -ForegroundColor Red
+        Write-Host "  No NVIDIA driver detected." -ForegroundColor Red
         Write-Log "No NVIDIA driver detected" -Level "WARN"
         return $info
     }
     $vc = switch ($info.Variant) { "Gaming"{"Magenta"} "GRID"{"Cyan"} default{"Gray"} }
-    Write-Host "  $($info.GpuName)" -ForegroundColor DarkGray
-    Write-Host "  $($info.Version)  " -NoNewline -ForegroundColor White
-    Write-Host "[$($info.Variant)]" -ForegroundColor $vc
+    Write-Host "  $($info.GpuName)" -ForegroundColor White
+    Write-Host "  $($info.Variant) $($info.Version)" -ForegroundColor $vc
     Write-Host ""
     Write-Log "GPU: $($info.GpuName) | Driver: $($info.Version) | Variant: $($info.Variant) | Date: $($info.DriverDate)" -Level "INFO"
     return $info
@@ -605,9 +604,9 @@ function Step-CheckOnline {
     Stop-Spinner -ctx $spinCtx
     Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
     if ($updateAvailable) {
-        Write-Host "  $([char]0x2191) Update available: $updateVersion" -ForegroundColor Yellow
+        Write-Host "  $([char]0x2191) $($info.Variant) $updateVersion available" -ForegroundColor Yellow
     } else {
-        Write-Host "  $([char]0x2713) Up to date." -ForegroundColor Green
+        Write-Host "  $([char]0x2713) Current $($info.Variant) driver is up to date." -ForegroundColor Green
     }
     Write-Host ""
     return @{ UpdateAvailable=$updateAvailable; LatestGaming=$latestGaming; LatestGrid=$latestGrid }
@@ -615,7 +614,6 @@ function Step-CheckOnline {
 
 function Step-ActionMenu {
     param($info, $online)
-    Show-Section "Available Actions"
     $opts = @()
     if ($online.UpdateAvailable)    { $opts += "Update driver  ($($info.Variant) -> latest)" }
     if ($info.Variant -eq "Gaming") { $opts += "Switch to GRID / Enterprise driver" }
@@ -783,7 +781,7 @@ $stopFlag[0] = $true
 Start-Sleep -Milliseconds 150
 $ps.EndInvoke($handle) | Out-Null
 $ps.Dispose(); $rs.Close()
-Write-Host "`r  Ready.                    " -ForegroundColor Green
+Write-Host "`r                                   "
 
 # -- Check for saved state -------------------------------------
 $existingState = Load-State
