@@ -79,7 +79,8 @@ function Stop-Spinner {
     $ctx.Psh.EndInvoke($ctx.Handle) | Out-Null
     $ctx.Psh.Dispose(); $ctx.Rs.Close()
     if ($Done) { Write-Host "`r  $Done                              " -ForegroundColor $Color }
-    else        { Write-Host "`r                                      " -NoNewline }
+    else        { Write-Host "`r                                      " }
+    [Console]::Out.Flush()
 }
 
 # -------------------------------------------------------------
@@ -407,6 +408,8 @@ function Invoke-NvidiaUninstall {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
     Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "Green"
+    [Console]::Out.Flush()
+    Write-Host ""
     Write-Log "Uninstall complete" -Level "OK"
 }
 
@@ -508,8 +511,13 @@ function Install-NvidiaDriver {
     $color = if($Variant -eq "Gaming"){"Magenta"}else{"Cyan"}
     $spinCtx = Start-Spinner -Label "Installing $Variant driver"
     try {
-        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $argList -Wait -PassThru -NoNewWindow
+        # Use PassThru without -Wait so the spinner runspace keeps running
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $argList -PassThru -NoNewWindow
+        while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
+        $proc.WaitForExit()
         Stop-Spinner -ctx $spinCtx -Done "Install complete." -Color $color
+        [Console]::Out.Flush()
+        Write-Host ""
         if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 14) {
             Write-Log "Driver installed successfully (ExitCode: $($proc.ExitCode))" -Level "OK"
             return $true
@@ -518,6 +526,7 @@ function Install-NvidiaDriver {
         return $true
     } catch {
         Stop-Spinner -ctx $spinCtx
+        [Console]::Out.Flush()
         Write-Log "Installation error: $_" -Level "ERROR"
         return $false
     }
@@ -785,10 +794,25 @@ if ($existingState -and $existingState.Step -in @("AFTER_DOWNLOAD","AFTER_UNINST
 
 if ($resumeAction -eq "resume") {
     Write-Host ""
-    Write-Status "Resuming from step: $($existingState.Step)" "Yellow"
+    $stepDesc = switch ($existingState.Step) {
+        "AFTER_DOWNLOAD"             { "Driver downloaded -- ready to uninstall" }
+        "UNINSTALLING"               { "Uninstall in progress -- resuming install" }
+        "AFTER_UNINSTALL_AND_CLEANUP"{ "Uninstall done -- ready to install" }
+        default                      { $existingState.Step }
+    }
+    Write-Host ""
+    Write-Host "  Resuming: " -NoNewline -ForegroundColor Yellow
+    Write-Host $stepDesc -ForegroundColor White
     Write-Log "Resuming from step: $($existingState.Step)" -Level "INFO"
     $cur = Get-InstalledNvidiaInfo
-    Write-Status "Current: $(if($cur.Installed){"$($cur.Version) [$($cur.Variant)] -- $($cur.GpuName)"}else{"No driver detected."})" "Cyan"
+    if ($cur.Installed) {
+        $vc = switch ($cur.Variant) { "Gaming"{"Magenta"} "GRID"{"Cyan"} default{"Gray"} }
+        Write-Host "  $($cur.GpuName)  " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($cur.Version)  " -NoNewline -ForegroundColor White
+        Write-Host "[$($cur.Variant)]" -ForegroundColor $vc
+    }
+    Write-Host "  Target:   " -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($existingState.TargetVariant) $($existingState.TargetVersion)" -ForegroundColor White
     Write-Host ""
     $rBucket = $existingState.S3Bucket; $rKey = $existingState.S3Key
     if (-not $rBucket -or -not $rKey) {
