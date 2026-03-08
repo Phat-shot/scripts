@@ -368,10 +368,10 @@ function Invoke-NvidiaUninstall {
         try {
             if ($app.UninstallString -match "MsiExec") {
                 $guid = [regex]::Match($app.UninstallString, '\{[^}]+\}').Value
-                if ($guid) { Start-Process msiexec.exe -ArgumentList "/x $guid /quiet /norestart" -Wait -NoNewWindow }
+                if ($guid) { $proc = Start-Process msiexec.exe -ArgumentList "/x $guid /quiet /norestart" -PassThru -NoNewWindow; if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } } }
             } elseif ($app.UninstallString -match "\.exe") {
                 $exe = [regex]::Match($app.UninstallString, '"?([^"]+\.exe)"?').Groups[1].Value
-                if ($exe -and (Test-Path $exe)) { Start-Process $exe -ArgumentList "-s -noreboot" -Wait -NoNewWindow }
+                if ($exe -and (Test-Path $exe)) { $proc = Start-Process $exe -ArgumentList "-s -noreboot" -PassThru -NoNewWindow; if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } } }
             }
         } catch { Write-Log "Failed to uninstall '$($app.DisplayName)': $_" -Level "WARN" }
     }
@@ -463,42 +463,52 @@ function Get-DriverPackage {
         return $dest
     }
 
-    Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkGray
+    $tmpDest = $dest + ".part"
     try {
         # Get file size for progress bar
         $meta  = Get-S3ObjectMetadata -BucketName $S3Bucket -Key $S3Key -Region "us-east-1" -ErrorAction SilentlyContinue
         $total = if ($meta) { $meta.ContentLength } else { 0 }
 
-        # Download in runspace so credentials are inherited and progress bar works in main thread
+        # Progress bar runs in a runspace, polling file size every 300ms
+        # Copy-S3Object runs in the main thread so credentials are available
         $tmpDest = $dest + ".part"
-        $dlDone  = [System.Collections.Generic.List[bool]]::new(); $dlDone.Add($false)
-        $dlError = [System.Collections.Generic.List[string]]::new(); $dlError.Add("")
-        $dlRs    = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $dlRs.Open()
-        $dlRs.SessionStateProxy.SetVariable('dlDone',  $dlDone)
-        $dlRs.SessionStateProxy.SetVariable('dlError', $dlError)
-        $dlRs.SessionStateProxy.SetVariable('S3Bucket', $S3Bucket)
-        $dlRs.SessionStateProxy.SetVariable('S3Key',    $S3Key)
-        $dlRs.SessionStateProxy.SetVariable('tmpDest',  $tmpDest)
-        $dlPsh = [System.Management.Automation.PowerShell]::Create()
-        $dlPsh.Runspace = $dlRs
-        $dlPsh.AddScript({
-            try {
-                Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $tmpDest -Region "us-east-1" -ErrorAction Stop | Out-Null
-            } catch { $dlError[0] = $_.ToString() }
-            $dlDone[0] = $true
+        $pbFlag  = [System.Collections.Generic.List[bool]]::new(); $pbFlag.Add($false)
+        $pbTotal = [System.Collections.Generic.List[long]]::new(); $pbTotal.Add($total)
+        $pbRs    = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $pbRs.Open()
+        $pbRs.SessionStateProxy.SetVariable('pbFlag',  $pbFlag)
+        $pbRs.SessionStateProxy.SetVariable('pbTotal', $pbTotal)
+        $pbRs.SessionStateProxy.SetVariable('tmpDest', $tmpDest)
+        $pbPsh = [System.Management.Automation.PowerShell]::Create()
+        $pbPsh.Runspace = $pbRs
+        $pbPsh.AddScript({
+            $width = 30
+            while (-not $pbFlag[0]) {
+                $cur   = if ([System.IO.File]::Exists($tmpDest)) { (New-Object System.IO.FileInfo($tmpDest)).Length } else { 0 }
+                $tot   = $pbTotal[0]
+                $pct   = if ($tot -gt 0) { [math]::Min(100,[int]($cur*100/$tot)) } else { 0 }
+                $fill  = [math]::Round($width * $pct / 100)
+                $bar   = ([char]0x2593).ToString() * $fill + ([char]0x2591).ToString() * ($width - $fill)
+                $curMB = [math]::Round($cur / 1MB, 0)
+                $totMB = [math]::Round($tot / 1MB, 0)
+                [Console]::Write("`r  Downloading  $bar  $pct%  $curMB / $totMB MB   ")
+                Start-Sleep -Milliseconds 300
+            }
         }) | Out-Null
-        $dlHandle = $dlPsh.BeginInvoke()
+        $pbHandle = $pbPsh.BeginInvoke()
 
-        while (-not $dlDone[0]) {
-            $cur = if (Test-Path $tmpDest) { (Get-Item $tmpDest).Length } else { 0 }
-            Write-ProgressBar -Current $cur -Total $total -Label "Downloading"
-            Start-Sleep -Milliseconds 300
+        # Download on main thread -- stdout suppressed so progress bar is not interrupted
+        $oldOut = [Console]::Out
+        [Console]::SetOut([System.IO.TextWriter]::Null)
+        try {
+            Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $tmpDest -Region "us-east-1" -ErrorAction Stop | Out-Null
+        } finally {
+            [Console]::SetOut($oldOut)
         }
-        $dlPsh.EndInvoke($dlHandle) | Out-Null
-        $dlPsh.Dispose(); $dlRs.Close()
 
-        if ($dlError[0]) { throw $dlError[0] }
+        $pbFlag[0] = $true
+        $pbPsh.EndInvoke($pbHandle) | Out-Null
+        $pbPsh.Dispose(); $pbRs.Close()
 
         if (Test-Path $tmpDest) { Move-Item $tmpDest $dest -Force }
         $sizeMB  = [math]::Round((Get-Item $dest).Length / 1MB, 0)
@@ -507,7 +517,7 @@ function Get-DriverPackage {
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
         return $dest
     } catch {
-        if (Test-Path "$dest.part") { Remove-Item "$dest.part" -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $tmpDest) { Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue }
         Write-Log "S3 download failed: $_" -Level "ERROR"
         return ""
     }
@@ -708,7 +718,7 @@ function Invoke-FullInstall {
 
     # -- STEP 3: INSTALL ---------------------------------------
     if ($state.Step -eq "AFTER_UNINSTALL_AND_CLEANUP") {
-        Write-Host ""; Write-Host "  Step 3 / 3  --  Install $($state.TargetVariant) Driver ($($state.TargetVersion))" -ForegroundColor White
+        Write-Host ""
 
         $installer = [string]$state.InstallerPath
         if (-not $installer -or -not (Test-Path $installer)) {
@@ -785,12 +795,15 @@ $ps.AddScript({
     }
 }) | Out-Null
 $handle = $ps.BeginInvoke()
-Set-AwsCredentials
+# Load AWS SDK -- redirect stdout temporarily to suppress any SDK init console output
+$oldOut = [Console]::Out
+[Console]::SetOut([System.IO.TextWriter]::Null)
+try { Set-AwsCredentials } finally { [Console]::SetOut($oldOut) }
 $stopFlag[0] = $true
 Start-Sleep -Milliseconds 150
 $ps.EndInvoke($handle) | Out-Null
 $ps.Dispose(); $rs.Close()
-Write-Host "`r                                   "
+Write-Host "`r                    " 
 
 # -- Check for saved state -------------------------------------
 $existingState = Load-State
