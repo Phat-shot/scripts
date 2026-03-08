@@ -92,7 +92,8 @@ function Write-ProgressBar {
     $pct   = [math]::Min(100, [int]($Current * 100 / $Total))
     $width = 30
     $filled = [math]::Round($width * $pct / 100)
-    $bar   = ([string][char]0x2593 * $filled) + ([string][char]0x2591 * ($width - $filled))
+    $bar   = ([string][char]0x2593).PadRight(1) * 1  # warmup
+    $bar   = (([char]0x2593).ToString() * $filled) + (([char]0x2591).ToString() * ($width - $filled))
     $curMB = [math]::Round($Current / 1MB, 0)
     $totMB = [math]::Round($Total   / 1MB, 0)
     [Console]::Write("`r  $Label  $bar  $pct%  $curMB / $totMB MB   ")
@@ -468,25 +469,41 @@ function Get-DriverPackage {
         $meta  = Get-S3ObjectMetadata -BucketName $S3Bucket -Key $S3Key -Region "us-east-1" -ErrorAction SilentlyContinue
         $total = if ($meta) { $meta.ContentLength } else { 0 }
 
-        # Download with progress polling
+        # Download in runspace so credentials are inherited and progress bar works in main thread
         $tmpDest = $dest + ".part"
-        $job = Start-Job -ScriptBlock {
-            param($b,$k,$f,$r)
-            Import-Module AWSPowerShell -ErrorAction SilentlyContinue
-            Copy-S3Object -BucketName $b -Key $k -LocalFile $f -Region $r -ErrorAction Stop | Out-Null
-        } -ArgumentList $S3Bucket,$S3Key,$tmpDest,"us-east-1"
+        $dlDone  = [System.Collections.Generic.List[bool]]::new(); $dlDone.Add($false)
+        $dlError = [System.Collections.Generic.List[string]]::new(); $dlError.Add("")
+        $dlRs    = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $dlRs.Open()
+        $dlRs.SessionStateProxy.SetVariable('dlDone',  $dlDone)
+        $dlRs.SessionStateProxy.SetVariable('dlError', $dlError)
+        $dlRs.SessionStateProxy.SetVariable('S3Bucket', $S3Bucket)
+        $dlRs.SessionStateProxy.SetVariable('S3Key',    $S3Key)
+        $dlRs.SessionStateProxy.SetVariable('tmpDest',  $tmpDest)
+        $dlPsh = [System.Management.Automation.PowerShell]::Create()
+        $dlPsh.Runspace = $dlRs
+        $dlPsh.AddScript({
+            try {
+                Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $tmpDest -Region "us-east-1" -ErrorAction Stop | Out-Null
+            } catch { $dlError[0] = $_.ToString() }
+            $dlDone[0] = $true
+        }) | Out-Null
+        $dlHandle = $dlPsh.BeginInvoke()
 
-        while ($job.State -eq "Running") {
+        while (-not $dlDone[0]) {
             $cur = if (Test-Path $tmpDest) { (Get-Item $tmpDest).Length } else { 0 }
             Write-ProgressBar -Current $cur -Total $total -Label "Downloading"
             Start-Sleep -Milliseconds 300
         }
-        Receive-Job $job -ErrorAction Stop | Out-Null
-        Remove-Job $job
+        $dlPsh.EndInvoke($dlHandle) | Out-Null
+        $dlPsh.Dispose(); $dlRs.Close()
+
+        if ($dlError[0]) { throw $dlError[0] }
 
         if (Test-Path $tmpDest) { Move-Item $tmpDest $dest -Force }
-        $sizeMB = [math]::Round((Get-Item $dest).Length / 1MB, 0)
-        Write-Host "`r  $([char]0x2593 * 30)  100%  $sizeMB MB       " -ForegroundColor Green
+        $sizeMB  = [math]::Round((Get-Item $dest).Length / 1MB, 0)
+        $fullBar = ([char]0x2593).ToString() * 30
+        Write-Host "`r  $fullBar  100%  $sizeMB MB       " -ForegroundColor Green
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
         return $dest
     } catch {
@@ -650,14 +667,6 @@ function Invoke-FullInstall {
     # -- STEP 1: PRE-FLIGHT + DOWNLOAD ------------------------
     if ($state.Step -notin @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP")) {
         Write-Host ""; Write-Host "  Step 1 / 3  --  Pre-flight & Download" -ForegroundColor White
-
-        if (-not (Get-Command Get-S3Object -ErrorAction SilentlyContinue)) {
-            Write-Status "ERROR: AWS Tools for PowerShell not installed." "Red"
-            Write-Status "Run: Install-Module -Name AWSPowerShell -Force -AllowClobber" "Yellow"
-            Write-Log "Pre-flight failed: AWS Tools not installed" -Level "ERROR"
-            return
-        }
-        Write-Log "Pre-flight: AWS Tools available" -Level "INFO"
 
         $disk = Get-PSDrive ((Split-Path $DownloadDir -Qualifier).TrimEnd(":")) -ErrorAction SilentlyContinue
         if ($disk -and $disk.Free -lt 2GB) {
