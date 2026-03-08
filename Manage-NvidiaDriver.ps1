@@ -790,13 +790,37 @@ Show-Banner
 $existingState = Load-State
 $isResume = $existingState -and $existingState.Step -in @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP","UNINSTALLING")
 
-# -- Load AWS credentials (skip on resume -- S3 loaded lazily if needed) ----
+# -- Load AWS: spinner on main thread, Set-AwsCredentials in background runspace --
 if (-not $isResume) {
-    $_loadCtx = Start-Spinner -Label "Loading"
-    $oldOut = [Console]::Out
-    [Console]::SetOut([System.IO.TextWriter]::Null)
-    try { Set-AwsCredentials } finally { [Console]::SetOut($oldOut) }
+    $_awsDone = [System.Collections.Generic.List[bool]]::new(); $_awsDone.Add($false)
+    $_awsRs   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $_awsRs.Open()
+    $_awsRs.SessionStateProxy.SetVariable("awsDone",     $_awsDone)
+    $_awsRs.SessionStateProxy.SetVariable("AwsCredsFile", $AwsCredsFile)
+    $_awsPsh  = [System.Management.Automation.PowerShell]::Create()
+    $_awsPsh.Runspace = $_awsRs
+    $_awsPsh.AddScript({
+        try {
+            Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+            if (Test-Path $AwsCredsFile) {
+                $ini = Get-Content $AwsCredsFile | Where-Object { $_ -match "^\s*\w" -and $_ -match "=" }
+                $kvp = @{}
+                $ini | ForEach-Object { $p = $_ -split "\s*=\s*", 2; if ($p.Count -eq 2) { $kvp[$p[0].Trim()] = $p[1].Trim() } }
+                $key = $kvp["aws_access_key_id"]; $secret = $kvp["aws_secret_access_key"]
+                if ($key -and $secret) { Set-AWSCredential -AccessKey $key -SecretKey $secret -ErrorAction SilentlyContinue }
+            }
+            Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
+        } catch {}
+        $awsDone[0] = $true
+    }) | Out-Null
+    # Spinner on main thread -- AWS loads in background runspace
+    $_loadCtx  = Start-Spinner -Label "Loading"
+    $_awsPsh.BeginInvoke() | Out-Null
+    while (-not $_awsDone[0]) { Start-Sleep -Milliseconds 100 }
+    $_awsPsh.Dispose(); $_awsRs.Close()
     Stop-Spinner -ctx $_loadCtx
+    # Now load credentials into the main session too (fast -- module already imported)
+    Set-AwsCredentials
 }
 
 if ($isResume) {
