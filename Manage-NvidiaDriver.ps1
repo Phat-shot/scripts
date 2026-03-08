@@ -80,14 +80,6 @@ function Stop-Spinner {
     [Console]::Out.Flush()
 }
 
-    $pct   = [math]::Min(100, [int]($Current * 100 / $Total))
-    $width = 30
-    $filled = [math]::Round($width * $pct / 100)
-    $bar   = (([char]0x2593).ToString() * $filled) + (([char]0x2591).ToString() * ($width - $filled))
-    $curMB = [math]::Round($Current / 1MB, 0)
-    $totMB = [math]::Round($Total   / 1MB, 0)
-    [Console]::Write("`r  $Label  $bar  $pct%  $curMB / $totMB MB   ")
-}
 
 # -------------------------------------------------------------
 #  AWS CREDENTIALS
