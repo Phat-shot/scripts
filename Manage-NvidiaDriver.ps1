@@ -52,6 +52,52 @@ function Write-Status {
 }
 
 # -------------------------------------------------------------
+#  SPINNER  (Braille, runs in runspace, call Stop-Spinner to end)
+# -------------------------------------------------------------
+function Start-Spinner {
+    param([string]$Label = "Working")
+    $flag = [System.Collections.Generic.List[bool]]::new(); $flag.Add($false)
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('stopFlag', $flag)
+    $rs.SessionStateProxy.SetVariable('label', $Label)
+    $psh = [System.Management.Automation.PowerShell]::Create(); $psh.Runspace = $rs
+    $psh.AddScript({
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $frames = [char[]]@(0x280B,0x2819,0x2839,0x2838,0x283C,0x2834,0x2826,0x2827,0x2807,0x280F)
+        $i = 0
+        while (-not $stopFlag[0]) {
+            [Console]::Write("`r  $label  " + $frames[$i % $frames.Count] + "  ")
+            Start-Sleep -Milliseconds 80; $i++
+        }
+    }) | Out-Null
+    $h = $psh.BeginInvoke()
+    return @{ Psh=$psh; Rs=$rs; Handle=$h; Flag=$flag }
+}
+function Stop-Spinner {
+    param($ctx, [string]$Done = "", [string]$Color = "Green")
+    $ctx.Flag[0] = $true; Start-Sleep -Milliseconds 150
+    $ctx.Psh.EndInvoke($ctx.Handle) | Out-Null
+    $ctx.Psh.Dispose(); $ctx.Rs.Close()
+    if ($Done) { Write-Host "`r  $Done                              " -ForegroundColor $Color }
+    else        { Write-Host "`r                                      " -NoNewline }
+}
+
+# -------------------------------------------------------------
+#  PROGRESS BAR  (block chars for download)
+# -------------------------------------------------------------
+function Write-ProgressBar {
+    param([long]$Current, [long]$Total, [string]$Label = "Downloading")
+    if ($Total -le 0) { return }
+    $pct   = [math]::Min(100, [int]($Current * 100 / $Total))
+    $width = 30
+    $filled = [math]::Round($width * $pct / 100)
+    $bar   = ([string][char]0x2593 * $filled) + ([string][char]0x2591 * ($width - $filled))
+    $curMB = [math]::Round($Current / 1MB, 0)
+    $totMB = [math]::Round($Total   / 1MB, 0)
+    [Console]::Write("`r  $Label  $bar  $pct%  $curMB / $totMB MB   ")
+}
+
+# -------------------------------------------------------------
 #  AWS CREDENTIALS
 #  Uses SharedCredentialsFile explicitly to avoid conflict with
 #  empty NetSDKCredentialsFile profile of the same name.
@@ -59,16 +105,23 @@ function Write-Status {
 function Set-AwsCredentials {
     if (Get-Command Set-AWSCredential -ErrorAction SilentlyContinue) {
         if (Test-Path $AwsCredsFile) {
-            # Manual credentials file (no IAM role attached)
             try {
-                # Use StoredCredentials parameter set -- avoids ambiguous parameter set error
-                $creds = Get-AWSCredential -ProfileName default -ProfileLocation $AwsCredsFile -ErrorAction Stop
-                Set-AWSCredential -Credential $creds -ErrorAction Stop
+                # Read key/secret directly from credentials file -- avoids parameter set ambiguity
+                $ini = Get-Content $AwsCredsFile | Where-Object { $_ -match '=' }
+                $kvp = @{}; $ini | ForEach-Object { $k,$v = $_ -split '\s*=\s*',2; $kvp[$k.Trim()] = $v.Trim() }
+                $key    = $kvp['aws_access_key_id']
+                $secret = $kvp['aws_secret_access_key']
+                if ($key -and $secret) {
+                    Set-AWSCredential -AccessKey $key -SecretKey $secret -StoreAs default -ErrorAction Stop
+                    Set-AWSCredential -ProfileName default -ErrorAction Stop
+                    Write-Log "AWS credentials loaded from file" -Level "INFO"
+                }
             } catch {
-                Write-Log "AWS credentials file found but could not be loaded: $_" -Level "WARN"
+                Write-Log "AWS credentials file could not be loaded: $_" -Level "WARN"
             }
+        } else {
+            Write-Log "No credentials file -- using IAM instance role" -Level "INFO"
         }
-        # If no credentials file, SDK automatically uses IAM instance role -- no action needed
         Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
     }
 }
@@ -141,8 +194,12 @@ function Show-Banner {
     Write-Host ""
     Write-Host "    ___________  " -NoNewline -ForegroundColor White
     Write-Host ""
-    Write-Host "  airgpu" -ForegroundColor White
-    Write-Host "  D R I V E R   M A N A G E R" -ForegroundColor DarkCyan
+    Write-Host "   (  +-------+  )" -ForegroundColor Cyan
+    Write-Host "  ( | +-----+ | )" -ForegroundColor Cyan
+    Write-Host " (  | |     | |  )   AIRGPU" -ForegroundColor Cyan
+    Write-Host " (  | |     | |  )   DRIVER MANAGER" -ForegroundColor DarkCyan
+    Write-Host " (  | +-----+ | )" -ForegroundColor Cyan
+    Write-Host "  (  +-------+  )" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -295,6 +352,7 @@ function Get-LatestGridVersion {
 # -------------------------------------------------------------
 function Invoke-NvidiaUninstall {
     Write-Log "Uninstall started" -Level "INFO"
+    $spinCtx = Start-Spinner -Label "Uninstalling"
 
     # Registered entries
     $apps = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -348,6 +406,7 @@ function Invoke-NvidiaUninstall {
     Get-Item "$env:SystemRoot\System32\DriverStore\FileRepository\nv*" -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
+    Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "Green"
     Write-Log "Uninstall complete" -Level "OK"
 }
 
@@ -399,16 +458,36 @@ function Get-DriverPackage {
         return $dest
     }
 
-    Write-Status "Downloading from S3..." "Cyan"
-    Write-Status "  s3://$S3Bucket/$S3Key" "DarkGray"
+    Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkGray
     Set-AwsCredentials
     try {
-        Copy-S3Object -BucketName $S3Bucket -Key $S3Key -LocalFile $dest -Region "us-east-1" -ErrorAction Stop | Out-Null
+        # Get file size for progress bar
+        $meta  = Get-S3ObjectMetadata -BucketName $S3Bucket -Key $S3Key -Region "us-east-1" -ErrorAction SilentlyContinue
+        $total = if ($meta) { $meta.ContentLength } else { 0 }
+
+        # Download with progress polling
+        $tmpDest = $dest + ".part"
+        $job = Start-Job -ScriptBlock {
+            param($b,$k,$f,$r)
+            Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+            Copy-S3Object -BucketName $b -Key $k -LocalFile $f -Region $r -ErrorAction Stop | Out-Null
+        } -ArgumentList $S3Bucket,$S3Key,$tmpDest,"us-east-1"
+
+        while ($job.State -eq "Running") {
+            $cur = if (Test-Path $tmpDest) { (Get-Item $tmpDest).Length } else { 0 }
+            Write-ProgressBar -Current $cur -Total $total -Label "Downloading"
+            Start-Sleep -Milliseconds 300
+        }
+        Receive-Job $job -ErrorAction Stop | Out-Null
+        Remove-Job $job
+
+        if (Test-Path $tmpDest) { Move-Item $tmpDest $dest -Force }
         $sizeMB = [math]::Round((Get-Item $dest).Length / 1MB, 0)
-        Write-Status "Download complete  ($sizeMB MB)" "Green"
+        Write-Host "`r  $([char]0x2593 * 30)  100%  $sizeMB MB       " -ForegroundColor Green
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
         return $dest
     } catch {
+        if (Test-Path "$dest.part") { Remove-Item "$dest.part" -Force -ErrorAction SilentlyContinue }
         Write-Log "S3 download failed: $_" -Level "ERROR"
         return ""
     }
@@ -423,12 +502,14 @@ function Install-NvidiaDriver {
         Write-Log "Installer not found: $InstallerPath" -Level "ERROR"
         return $false
     }
-    Write-Host "  Installing $Variant driver..." -ForegroundColor $(if($Variant -eq "Gaming"){"Magenta"}else{"Blue"})
     Write-Log "Silent install started: $(Split-Path $InstallerPath -Leaf) [$Variant]" -Level "INFO"
     $argList = @("-s","-noreboot","-clean")
     if ($Variant -eq "GRID") { $argList += "-noeula" }
+    $color = if($Variant -eq "Gaming"){"Magenta"}else{"Cyan"}
+    $spinCtx = Start-Spinner -Label "Installing $Variant driver"
     try {
         $proc = Start-Process -FilePath $InstallerPath -ArgumentList $argList -Wait -PassThru -NoNewWindow
+        Stop-Spinner -ctx $spinCtx -Done "Install complete." -Color $color
         if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 14) {
             Write-Log "Driver installed successfully (ExitCode: $($proc.ExitCode))" -Level "OK"
             return $true
@@ -436,6 +517,7 @@ function Install-NvidiaDriver {
         Write-Log "Driver installer exited with code $($proc.ExitCode)" -Level "WARN"
         return $true
     } catch {
+        Stop-Spinner -ctx $spinCtx
         Write-Log "Installation error: $_" -Level "ERROR"
         return $false
     }
@@ -488,10 +570,10 @@ function Step-ShowStatus {
         Write-Log "No NVIDIA driver detected" -Level "WARN"
         return $info
     }
-    $vc = switch ($info.Variant) { "Gaming"{"Magenta"} "GRID"{"Blue"} default{"Gray"} }
-    Write-Host "  $($info.GpuName)  " -NoNewline -ForegroundColor Cyan
-    Write-Host "$($info.Version)" -NoNewline -ForegroundColor White
-    Write-Host "  [" -NoNewline; Write-Host $info.Variant -NoNewline -ForegroundColor $vc; Write-Host "]"
+    $vc = switch ($info.Variant) { "Gaming"{"Magenta"} "GRID"{"Cyan"} default{"Gray"} }
+    Write-Host "  $($info.GpuName)" -ForegroundColor DarkGray
+    Write-Host "  $($info.Version)  " -NoNewline -ForegroundColor White
+    Write-Host "[$($info.Variant)]" -ForegroundColor $vc
     Write-Host ""
     Write-Log "GPU: $($info.GpuName) | Driver: $($info.Version) | Variant: $($info.Variant) | Date: $($info.DriverDate)" -Level "INFO"
     return $info
@@ -500,19 +582,25 @@ function Step-ShowStatus {
 function Step-CheckOnline {
     param($info)
     Write-Host "  Checking for updates..." -ForegroundColor DarkGray
+    $spinCtx = Start-Spinner -Label "Checking for updates"
     $latestGaming = Get-LatestGamingVersion
     $latestGrid   = Get-LatestGridVersion
-    Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
     $updateAvailable = $false
+    $updateVersion   = ""
     try {
         $latest = if ($info.Variant -eq "GRID") { $latestGrid.Version } else { $latestGaming.Version }
         if ([Version]$latest -gt [Version]$info.Version) {
-            $updateAvailable = $true
-            Write-Log "Update available: $latest" -Level "OK"
-        } else {
-            Write-Log "Driver is up to date ($($info.Version))" -Level "INFO"
+            $updateAvailable = $true; $updateVersion = $latest
         }
-    } catch { Write-Log "Could not compare versions" -Level "WARN" }
+    } catch {}
+    Stop-Spinner -ctx $spinCtx
+    Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
+    if ($updateAvailable) {
+        Write-Host "  $([char]0x2191) Update available: $updateVersion" -ForegroundColor Yellow
+    } else {
+        Write-Host "  $([char]0x2713) Up to date." -ForegroundColor Green
+    }
+    Write-Host ""
     return @{ UpdateAvailable=$updateAvailable; LatestGaming=$latestGaming; LatestGrid=$latestGrid }
 }
 
@@ -625,14 +713,25 @@ function Invoke-FullInstall {
         if ($ok) {
             if ($state.TargetVariant -eq "Gaming") { Set-GamingLicense }
             Clear-State
+            # Cleanup: remove downloaded installer + downloads folder
+            try {
+                if (Test-Path $DownloadDir) { Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue }
+                Write-Log "Downloads cleaned up" -Level "INFO"
+            } catch { Write-Log "Cleanup warning: $_" -Level "WARN" }
+            # Remove script (EXE will re-download fresh next run)
+            $selfScript = $MyInvocation.ScriptName
             Write-Host ""
-            Write-Host "  +----------------------------------------------+" -ForegroundColor Green
-            Write-Host "  |  Installation completed successfully.          |" -ForegroundColor Green
-            Write-Host "  +----------------------------------------------+" -ForegroundColor Green
+            Write-Host "  Done. Driver installed successfully." -ForegroundColor Green
+            Write-Host "  Log: $LogFile" -ForegroundColor DarkGray
             Write-Host ""
-            Write-Log "Installation completed successfully" -Level "OK"
+            Write-Log "Installation completed successfully. Downloads cleaned." -Level "OK"
             if (Prompt-YesNo "Reboot now to finalize driver?") {
-                Start-Sleep -Seconds 5; Restart-Computer -Force
+                Start-Sleep -Seconds 3; Restart-Computer -Force
+            }
+            # Remove script after reboot prompt (EXE downloads fresh next time)
+            if (Test-Path $selfScript) {
+                Start-Sleep -Milliseconds 500
+                Remove-Item $selfScript -Force -ErrorAction SilentlyContinue
             }
         } else {
             Write-Host ""
@@ -651,7 +750,7 @@ foreach ($dir in @($WorkDir,$DownloadDir)) {
 
 Show-Banner
 
-# -- Loading Prerequisites (spinner via runspace) -------------
+# -- Loading Prerequisites (Braille spinner via runspace) ----
 $stopFlag = [System.Collections.Generic.List[bool]]::new()
 $stopFlag.Add($false)
 $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
@@ -660,21 +759,22 @@ $rs.SessionStateProxy.SetVariable('stopFlag', $stopFlag)
 $ps = [System.Management.Automation.PowerShell]::Create()
 $ps.Runspace = $rs
 $ps.AddScript({
-    $frames = @('|','/','-','\')
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $frames = [char[]]@(0x280B,0x2819,0x2839,0x2838,0x283C,0x2834,0x2826,0x2827,0x2807,0x280F)
     $i = 0
     while (-not $stopFlag[0]) {
-        [Console]::Write("`r  Loading Prerequisites... " + $frames[$i % 4] + " ")
-        Start-Sleep -Milliseconds 120
+        [Console]::Write("`r  Loading...  " + $frames[$i % $frames.Count] + "  ")
+        Start-Sleep -Milliseconds 80
         $i++
     }
 }) | Out-Null
 $handle = $ps.BeginInvoke()
 Set-AwsCredentials
 $stopFlag[0] = $true
-Start-Sleep -Milliseconds 200
+Start-Sleep -Milliseconds 150
 $ps.EndInvoke($handle) | Out-Null
 $ps.Dispose(); $rs.Close()
-Write-Host "`r  Loading Prerequisites... done.  " -ForegroundColor Green
+Write-Host "`r  Ready.                    " -ForegroundColor Green
 
 # -- Check for saved state -------------------------------------
 $existingState = Load-State
@@ -699,7 +799,6 @@ if ($resumeAction -eq "resume") {
     }
     Invoke-FullInstall -TargetVariant $existingState.TargetVariant -Version $existingState.TargetVersion `
         -S3Bucket $rBucket -S3Key $rKey
-    Write-Host ""; Write-Status "Log: $LogFile" "DarkGray"; Write-Host ""
     exit 0
 }
 
@@ -711,13 +810,12 @@ if (-not $info.Installed) {
     $s3 = if ($variant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
     Save-State @{ Step="FRESH"; TargetVariant=$variant; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
     Invoke-FullInstall -TargetVariant $variant -Version $s3.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
-    Write-Host ""; Write-Status "Log: $LogFile" "DarkGray"; Write-Host ""
     exit 0
 }
 
 $online = Step-CheckOnline -info $info
 $action = Step-ActionMenu  -info $info -online $online
-if ($null -eq $action) { Write-Host ""; Write-Status "Log: $LogFile" "DarkGray"; Write-Host ""; exit 0 }
+if ($null -eq $action) { exit 0 }
 
 switch -Wildcard ($action) {
     "*Update*" {
@@ -748,6 +846,3 @@ switch -Wildcard ($action) {
     default             { Write-Status "No action taken." "DarkGray" }
 }
 
-Write-Host ""
-Write-Status "Log: $LogFile" "DarkGray"
-Write-Host ""

@@ -63,45 +63,46 @@ class Program {
 
         // Banner
         Console.Clear();
-        Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine("");
-        Console.WriteLine("     ___________       _                   ");
-        Console.WriteLine("    |           |   __ (_) _ __  __ _  _ __ ");
-        Console.WriteLine("    |  _______  |  / _` || || '__|/ _` || '_ \\");
-        Console.WriteLine("    | |       | | | (_| || || |  | (_| || |_) |");
-        Console.WriteLine("    | |_______| |  \\__,_||_||_|   \\__, || .__/");
-        Console.WriteLine("    |___________|                  |___/ |_|  ");
-        Console.WriteLine("");
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine("                  D R I V E R   M A N A G E R");
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("                  NVIDIA  *  Amazon EC2  *  Windows 11");
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("   (  +-------+  )");
+        Console.WriteLine("  ( | +-----+ | )");
+        Console.Write(" (  | |     | |  )   "); Console.ForegroundColor = ConsoleColor.Cyan;    Console.WriteLine("AIRGPU");
+        Console.Write(" (  | |     | |  )   "); Console.ForegroundColor = ConsoleColor.DarkCyan; Console.WriteLine("DRIVER MANAGER");
+        Console.WriteLine(" (  | +-----+ | )");
+        Console.WriteLine("  (  +-------+  )");
         Console.ResetColor();
         Console.WriteLine("");
 
-        // Download latest script
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine("  Fetching latest script from GitHub...");
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("  " + RawUrl);
-        Console.ResetColor();
-        Console.WriteLine("");
+        // Skip download if state file exists (mid-install resume)
+        string stateFile = Path.Combine(WorkDir, "state.json");
+        bool hasState    = File.Exists(stateFile) && File.Exists(scriptPath);
 
-        try {
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-            using (var wc = new WebClient())
-                wc.DownloadFile(RawUrl, scriptPath);
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("  Downloaded: " + scriptPath);
+        if (hasState) {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("  Resuming from saved state...");
             Console.ResetColor();
-        } catch (Exception ex) {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("  ERROR: Could not download script.");
-            Console.WriteLine("  " + ex.Message);
+        } else {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("  Updating script...");
             Console.ResetColor();
-            Console.WriteLine("\n  Press any key to exit...");
-            Console.ReadKey();
-            return 1;
+            try {
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                using (var wc = new WebClient())
+                    wc.DownloadFile(RawUrl, scriptPath);
+            } catch (Exception ex) {
+                if (!File.Exists(scriptPath)) {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("  ERROR: Could not download script and no cached version found.");
+                    Console.WriteLine("  " + ex.Message);
+                    Console.ResetColor();
+                    Console.WriteLine("\n  Press any key to exit...");
+                    Console.ReadKey();
+                    return 1;
+                }
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("  Download failed -- using cached script.");
+                Console.ResetColor();
+            }
         }
 
         // Launch
