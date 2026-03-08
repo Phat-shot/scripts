@@ -16,7 +16,6 @@
     Log file    : C:\Program Files\airgpu\Driver Manager\driver_manager.log
 #>
 
-param([switch]$Resume)
 
 # -------------------------------------------------------------
 #  CONFIGURATION
@@ -30,6 +29,8 @@ $RunName      = "airgpuDriverManagerResume"
 $ScriptPath   = $MyInvocation.MyCommand.Path
 $ExePath      = "C:\Program Files\airgpu\airgpu-driver-manager.exe"
 $AwsCredsFile = "$env:USERPROFILE\.aws\credentials"
+$script:S3CacheGaming = $null   # cached per session
+$script:S3CacheGrid   = $null
 
 # -------------------------------------------------------------
 #  LOGGING  (moderate -- key events only, no per-registry-key spam)
@@ -40,16 +41,12 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
     # Only print to console for WARN/ERROR (INFO goes to log file only)
     switch ($Level) {
-        "ERROR" { Write-Host "  [ERROR] $Message" -ForegroundColor Red }
-        "WARN"  { Write-Host "  [WARN]  $Message" -ForegroundColor Yellow }
-        "OK"    { Write-Host "  [OK]    $Message" -ForegroundColor Green }
+        "ERROR" { Write-Host "  [!] $Message" -ForegroundColor Red }
+        "WARN"  { Write-Host "  [!] $Message" -ForegroundColor Yellow }
+        # OK and INFO: log file only
     }
 }
 
-function Write-Status {
-    param([string]$Message, [string]$Color = "White")
-    Write-Host "  $Message" -ForegroundColor $Color
-}
 
 # -------------------------------------------------------------
 #  SPINNER  (Braille, runs in runspace, call Stop-Spinner to end)
@@ -83,16 +80,9 @@ function Stop-Spinner {
     [Console]::Out.Flush()
 }
 
-# -------------------------------------------------------------
-#  PROGRESS BAR  (block chars for download)
-# -------------------------------------------------------------
-function Write-ProgressBar {
-    param([long]$Current, [long]$Total, [string]$Label = "Downloading")
-    if ($Total -le 0) { return }
     $pct   = [math]::Min(100, [int]($Current * 100 / $Total))
     $width = 30
     $filled = [math]::Round($width * $pct / 100)
-    $bar   = ([string][char]0x2593).PadRight(1) * 1  # warmup
     $bar   = (([char]0x2593).ToString() * $filled) + (([char]0x2591).ToString() * ($width - $filled))
     $curMB = [math]::Round($Current / 1MB, 0)
     $totMB = [math]::Round($Total   / 1MB, 0)
@@ -206,8 +196,6 @@ function Show-Banner {
     Write-Host ""
 }
 
-function Show-Section { param([string]$T)
-    Write-Host ""; Write-Host "  -- $T " -ForegroundColor DarkGray; Write-Host "" }
 
 function Prompt-YesNo {
     param([string]$Q)
@@ -234,37 +222,6 @@ function Prompt-Menu {
 #  Shown on startup when a saved state exists.
 #  Options: Resume | Start over | Clean up & exit
 # -------------------------------------------------------------
-function Show-StateDialog {
-    param([hashtable]$State)
-    $stepLabel = switch ($State.Step) {
-        "AFTER_DOWNLOAD"  { "Waiting to uninstall  (driver already downloaded)" }
-        "AFTER_UNINSTALL" { "Waiting to install  (uninstall done, reboot completed)" }
-        "AFTER_REGISTRY"  { "Waiting to install  (registry cleaned, reboot completed)" }
-        default           { $State.Step }
-    }
-    $targetLine = ("  |  Target  : " + $State.TargetVariant + " " + $State.TargetVersion).PadRight(52) + "|"
-    $stepLine   = ("  |  Step    : " + $stepLabel).PadRight(52) + "|"
-    Write-Host ""
-    Write-Host "  +---------------------------------------------------+" -ForegroundColor Yellow
-    Write-Host "  |  Saved state found                              |" -ForegroundColor Yellow
-    Write-Host $targetLine -ForegroundColor Yellow
-    Write-Host $stepLine   -ForegroundColor Yellow
-    Write-Host "  +---------------------------------------------------+" -ForegroundColor Yellow
-    Write-Host ""
-
-    $sel = Prompt-Menu "What would you like to do?" @(
-        "Resume from saved step  ($($State.Step))",
-        "Start over  (clear state, keep downloaded files)",
-        "Clean up everything  (clear state + downloads) and exit"
-    )
-
-    switch ($sel) {
-        1 { return "resume" }
-        2 { Clear-State; return "fresh" }
-        3 { Clear-State; Clear-Downloads; Write-Status "Cleaned up. Exiting." "Green"; exit 0 }
-        0 { Write-Status "Cancelled." "DarkGray"; exit 0 }
-    }
-}
 
 # -------------------------------------------------------------
 #  GPU DETECTION
@@ -272,26 +229,35 @@ function Show-StateDialog {
 function Get-InstalledNvidiaInfo {
     $info = @{ Installed=$false; Version=""; Variant="Unknown"; GpuName=""; DriverDate="" }
 
-    $gpu = Get-WmiObject Win32_VideoController |
-        Where-Object { $_.Name -like "*NVIDIA*" -or $_.AdapterCompatibility -like "*NVIDIA*" } |
-        Select-Object -First 1
-    if (-not $gpu) { return $info }
-
-    $info.GpuName    = $gpu.Name
-    $info.DriverDate = $gpu.DriverDate
-    $info.Version    = if ($gpu.DriverVersion -match '(\d{3})(\d{2})$') { "$($Matches[1]).$($Matches[2])" }
-                       else { $gpu.DriverVersion }
-
+    # Try nvidia-smi first (most accurate, direct from driver)
     $smi = if (Test-Path "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe") {
                "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe" } else { "nvidia-smi" }
+    $smiOk = $false
     try {
         $out = & $smi --query-gpu=name,driver_version --format=csv,noheader 2>&1
         if ($LASTEXITCODE -eq 0 -and $out) {
             $p = $out -split ","
-            if ($p.Count -ge 2) { $info.GpuName = $p[0].Trim(); $info.Version = $p[1].Trim() }
+            if ($p.Count -ge 2) {
+                $info.GpuName = $p[0].Trim()
+                $info.Version = $p[1].Trim()
+                $smiOk = $true
+            }
         }
     } catch { }
 
+    # Fall back to WMI if nvidia-smi unavailable
+    if (-not $smiOk) {
+        $gpu = Get-WmiObject Win32_VideoController |
+            Where-Object { $_.Name -like "*NVIDIA*" -or $_.AdapterCompatibility -like "*NVIDIA*" } |
+            Select-Object -First 1
+        if (-not $gpu) { return $info }  # no NVIDIA GPU found at all
+        $info.GpuName    = $gpu.Name
+        $info.DriverDate = $gpu.DriverDate
+        $info.Version    = if ($gpu.DriverVersion -match '(\d{3})(\d{2})$') { "$($Matches[1]).$($Matches[2])" }
+                           else { $gpu.DriverVersion }
+    }
+
+    if (-not $info.GpuName -and -not $info.Version) { return $info }
     $info.Installed = $true
 
     $names = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -325,14 +291,21 @@ function Get-S3DriverInfo {
         $exe = Get-S3Object -BucketName $Bucket -KeyPrefix $Prefix -Region "us-east-1" -ErrorAction Stop |
             Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
         if ($exe -and (Split-Path $exe.Key -Leaf) -match '(\d+\.\d+)') {
-            return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$Bucket }
+            return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$Bucket; Error=$false }
         }
-    } catch { Write-Log "S3 lookup failed ($Bucket): $_" -Level "WARN" }
-    return @{ Version="Unknown"; S3Key=""; S3Bucket="" }
+        Write-Log "S3 lookup: no .exe found in $Bucket/$Prefix" -Level "WARN"
+        return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$false }
+    } catch {
+        Write-Log "S3 lookup failed ($Bucket): $_" -Level "WARN"
+        return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$true }
+    }
 }
 
 function Get-LatestGamingVersion {
-    return Get-S3DriverInfo -Bucket "nvidia-gaming" -Prefix "windows/latest/"
+    if (-not $script:S3CacheGaming) {
+        $script:S3CacheGaming = Get-S3DriverInfo -Bucket "nvidia-gaming" -Prefix "windows/latest/"
+    }
+    return $script:S3CacheGaming
 }
 
 function Test-GamingDriverSupported {
@@ -347,7 +320,10 @@ function Test-GamingDriverSupported {
 }
 
 function Get-LatestGridVersion {
-    return Get-S3DriverInfo -Bucket "ec2-windows-nvidia-drivers" -Prefix "latest/"
+    if (-not $script:S3CacheGrid) {
+        $script:S3CacheGrid = Get-S3DriverInfo -Bucket "ec2-windows-nvidia-drivers" -Prefix "latest/"
+    }
+    return $script:S3CacheGrid
 }
 
 # -------------------------------------------------------------
@@ -414,8 +390,14 @@ function Invoke-NvidiaUninstall {
 
     Write-Log "Stopping NVIDIA services" -Level "INFO"
     Get-Service | Where-Object { $_.Name -like "nv*" -or $_.DisplayName -like "*NVIDIA*" } | ForEach-Object {
-        Stop-Service $_.Name -Force -ErrorAction SilentlyContinue
-        sc.exe delete $_.Name 2>&1 | Out-Null
+        $svcName = $_.Name
+        try {
+            $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Stopped") {
+                $svc.Stop(); $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(10))
+            }
+        } catch { $null }
+        sc.exe delete $svcName 2>&1 | Out-Null
     }
 
     @("$env:ProgramFiles\NVIDIA Corporation","$env:ProgramFiles\NVIDIA",
@@ -453,7 +435,6 @@ function Invoke-RegistryCleanup {
             Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -like "*NVIDIA*" } |
             ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue; $removed++ }
     }
-    Write-Status "Registry cleanup complete  ($removed keys removed)." "Green"
     Write-Log "Registry cleanup complete ($removed keys removed)" -Level "OK"
 }
 
@@ -465,7 +446,7 @@ function Get-DriverPackage {
     if (-not (Test-Path $DownloadDir)) { New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null }
 
     if (-not $S3Bucket -or -not $S3Key) {
-        Write-Status "No S3 source available. Enter installer path manually (empty = cancel):" "Yellow"
+        Write-Host "  No S3 source available. Enter installer path manually (empty = cancel):" -ForegroundColor Yellow
         $manual = (Read-Host "  Path").Trim('"').Trim()
         if ($manual -and (Test-Path $manual)) { return $manual }
         Write-Log "No installer source available" -Level "ERROR"
@@ -474,7 +455,7 @@ function Get-DriverPackage {
 
     $dest = "$DownloadDir\$(Split-Path $S3Key -Leaf)"
     if (Test-Path $dest) {
-        Write-Status "Using cached installer: $(Split-Path $dest -Leaf)" "Green"
+        Write-Host "  Using cached installer: $(Split-Path $dest -Leaf)" -ForegroundColor Green
         return $dest
     }
 
@@ -497,16 +478,20 @@ function Get-DriverPackage {
         $pbPsh = [System.Management.Automation.PowerShell]::Create()
         $pbPsh.Runspace = $pbRs
         $pbPsh.AddScript({
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+            $filled_c = [char]0x2588  # full block (more widely supported)
+            $empty_c  = [char]0x2591  # light shade
             $width = 30
             while (-not $pbFlag[0]) {
                 $cur   = if ([System.IO.File]::Exists($tmpDest)) { (New-Object System.IO.FileInfo($tmpDest)).Length } else { 0 }
                 $tot   = $pbTotal[0]
                 $pct   = if ($tot -gt 0) { [math]::Min(100,[int]($cur*100/$tot)) } else { 0 }
                 $fill  = [math]::Round($width * $pct / 100)
-                $bar   = ([char]0x2593).ToString() * $fill + ([char]0x2591).ToString() * ($width - $fill)
+                $bar   = $filled_c.ToString() * $fill + $empty_c.ToString() * ($width - $fill)
                 $curMB = [math]::Round($cur / 1MB, 0)
                 $totMB = [math]::Round($tot / 1MB, 0)
-                [Console]::Write("`r  Downloading  $bar  $pct%  $curMB / $totMB MB   ")
+                [Console]::Write("`r  $pct%  $bar  $curMB / $totMB MB   ")
                 Start-Sleep -Milliseconds 300
             }
         }) | Out-Null
@@ -527,8 +512,8 @@ function Get-DriverPackage {
 
         if (Test-Path $tmpDest) { Move-Item $tmpDest $dest -Force }
         $sizeMB  = [math]::Round((Get-Item $dest).Length / 1MB, 0)
-        $fullBar = ([char]0x2593).ToString() * 30
-        Write-Host "`r  $fullBar  100%  $sizeMB MB       " -ForegroundColor Green
+        $fullBar = ([char]0x2588).ToString() * 30
+        Write-Host "`r  100%  $fullBar  $sizeMB MB       " -ForegroundColor Green
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
         return $dest
     } catch {
@@ -598,8 +583,8 @@ function Request-Reboot {
     param([string]$Reason, [string]$NextStep)
     Register-ResumeOnBoot -NextStep $NextStep
     Write-Host ""
-    Write-Status "Reboot required  ($Reason)" "Yellow"
-    Write-Status "Script will resume automatically at login." "DarkGray"
+    Write-Host "  Reboot required  ($Reason)" -ForegroundColor Yellow
+    Write-Host "  Script will resume automatically at login." -ForegroundColor DarkGray
     Write-Host ""
     if (Prompt-YesNo "Reboot now?") {
         Write-Log "Rebooting now. Resume step: $NextStep" -Level "INFO"
@@ -607,7 +592,7 @@ function Request-Reboot {
         Restart-Computer -Force
     } else {
         Write-Log "Reboot deferred. Resume step: $NextStep" -Level "INFO"
-        Write-Status "Reboot when ready. Resume manually with: -Resume" "DarkGray"
+        Write-Host "  Reboot when ready. Resume manually with: -Resume" -ForegroundColor DarkGray
     }
 }
 
@@ -645,7 +630,10 @@ function Step-CheckOnline {
     } catch {}
     Stop-Spinner -ctx $spinCtx
     Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
-    if ($updateAvailable) {
+    $s3err = ($latestGaming.Error -and $info.Variant -eq "Gaming") -or ($latestGrid.Error -and $info.Variant -eq "GRID")
+    if ($s3err) {
+        Write-Host "  [!] Could not reach update server -- version check skipped." -ForegroundColor Yellow
+    } elseif ($updateAvailable) {
         Write-Host "  $([char]0x2191) $($info.Variant) $updateVersion available" -ForegroundColor Yellow
     } else {
         Write-Host "  $([char]0x2713) Current $($info.Variant) driver is up to date." -ForegroundColor Green
@@ -669,7 +657,7 @@ function Step-ActionMenu {
     if (-not $online.UpdateAvailable) { $opts += "Reinstall current driver  ($($info.Version))" }
     $opts += "Show status only  (no changes)"
     $sel = Prompt-Menu "What would you like to do?" $opts
-    if ($sel -eq 0) { Write-Status "Cancelled." "DarkGray"; return $null }
+    if ($sel -eq 0) { Write-Host "  Cancelled." -ForegroundColor DarkGray; return $null }
     return $opts[$sel - 1]
 }
 
@@ -683,19 +671,18 @@ function Invoke-FullInstall {
     param([string]$TargetVariant, [string]$Version, [string]$S3Bucket = "", [string]$S3Key = "")
 
     $state = Load-State
-    if ($null -eq $state) { $state = @{} }
-    $state.TargetVariant = $TargetVariant
-    $state.TargetVersion = $Version
-    $state.S3Bucket      = $S3Bucket
-    $state.S3Key         = $S3Key
+    if (-not $state) { $state = @{} }
+    # Merge caller args into state (caller may supply fresher S3 info)
+    if ($TargetVariant) { $state.TargetVariant = $TargetVariant }
+    if ($Version)       { $state.TargetVersion = $Version }
+    if ($S3Bucket)      { $state.S3Bucket      = $S3Bucket }
+    if ($S3Key)         { $state.S3Key         = $S3Key }
 
     # -- STEP 1: PRE-FLIGHT + DOWNLOAD ------------------------
     if ($state.Step -notin @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP")) {
-        Write-Host ""; Write-Host "  Step 1 / 3  --  Pre-flight & Download" -ForegroundColor White
-
         $disk = Get-PSDrive ((Split-Path $DownloadDir -Qualifier).TrimEnd(":")) -ErrorAction SilentlyContinue
         if ($disk -and $disk.Free -lt 2GB) {
-            Write-Status "ERROR: Not enough disk space ($([math]::Round($disk.Free/1GB,1)) GB free, need 2 GB)" "Red"
+            Write-Host "  ERROR: Not enough disk space ($([math]::Round($disk.Free/1GB,1)) GB free, need 2 GB)" -ForegroundColor Red
             Write-Log "Pre-flight failed: insufficient disk space" -Level "ERROR"
             return
         }
@@ -711,11 +698,10 @@ function Invoke-FullInstall {
 
         $installer = Get-DriverPackage -Variant $TargetVariant -S3Bucket $dlBucket -S3Key $dlKey
         if (-not $installer -or -not (Test-Path $installer)) {
-            Write-Status "Download failed. Current driver untouched." "Red"
+            Write-Host "  Download failed. Current driver untouched." -ForegroundColor Red
             Write-Log "Pre-flight failed: download failed" -Level "ERROR"
             return
         }
-        Write-Status "[OK] Driver ready: $(Split-Path $installer -Leaf)" "Green"
         $state.InstallerPath = [string]$installer
         $state.Step = "AFTER_DOWNLOAD"
         Save-State $state
@@ -723,7 +709,6 @@ function Invoke-FullInstall {
 
     # -- STEP 2: UNINSTALL + REGISTRY CLEANUP (combined, 1 reboot) --
     if ($state.Step -eq "AFTER_DOWNLOAD") {
-        Write-Host ""; Write-Host "  Step 2 / 3  --  Uninstall & Registry Cleanup" -ForegroundColor White
         $state.Step = "UNINSTALLING"; Save-State $state
         Invoke-NvidiaUninstall
         Invoke-RegistryCleanup
@@ -738,15 +723,15 @@ function Invoke-FullInstall {
 
         $installer = [string]$state.InstallerPath
         if (-not $installer -or -not (Test-Path $installer)) {
-            Write-Status "Cached installer missing -- re-downloading..." "Yellow"
+            Write-Host "  Cached installer missing -- re-downloading..." -ForegroundColor Yellow
             Write-Log "Installer missing from cache, re-downloading" -Level "WARN"
             $installer = Get-DriverPackage -Variant $state.TargetVariant -S3Bucket $state.S3Bucket -S3Key $state.S3Key
         }
         if (-not $installer -or -not (Test-Path $installer)) {
-            Write-Status "No installer available. Cannot continue." "Red"
+            Write-Host "  No installer available. Cannot continue." -ForegroundColor Red
             Write-Log "Install aborted: no installer available" -Level "ERROR"
             Write-Host ""
-            Write-Status "State preserved. Re-run to retry." "Yellow"
+            Write-Host "  State preserved. Re-run to retry." -ForegroundColor Yellow
             return
         }
 
@@ -777,7 +762,7 @@ function Invoke-FullInstall {
             }
         } else {
             Write-Host ""
-            Write-Status "Installation failed. State preserved -- re-run to retry." "Red"
+            Write-Host "  Installation failed. State preserved -- re-run to retry." -ForegroundColor Red
             Write-Log "Installation failed. State preserved at AFTER_UNINSTALL_AND_CLEANUP." -Level "ERROR"
         }
     }
@@ -786,40 +771,22 @@ function Invoke-FullInstall {
 # -------------------------------------------------------------
 #  ENTRY POINT
 # -------------------------------------------------------------
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding           = [System.Text.Encoding]::UTF8
+
 foreach ($dir in @($WorkDir,$DownloadDir)) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
 Show-Banner
 
-# -- Loading Prerequisites (Braille spinner via runspace) ----
-$stopFlag = [System.Collections.Generic.List[bool]]::new()
-$stopFlag.Add($false)
-$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-$rs.Open()
-$rs.SessionStateProxy.SetVariable('stopFlag', $stopFlag)
-$ps = [System.Management.Automation.PowerShell]::Create()
-$ps.Runspace = $rs
-$ps.AddScript({
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    $frames = [char[]]@(0x280B,0x2819,0x2839,0x2838,0x283C,0x2834,0x2826,0x2827,0x2807,0x280F)
-    $i = 0
-    while (-not $stopFlag[0]) {
-        [Console]::Write("`r  Loading...  " + $frames[$i % $frames.Count] + "  ")
-        Start-Sleep -Milliseconds 80
-        $i++
-    }
-}) | Out-Null
-$handle = $ps.BeginInvoke()
-# Load AWS SDK -- redirect stdout temporarily to suppress any SDK init console output
+# -- Load AWS (spinner suppresses SDK init output) ----------
+$_loadCtx = Start-Spinner -Label "Loading"
 $oldOut = [Console]::Out
 [Console]::SetOut([System.IO.TextWriter]::Null)
 try { Set-AwsCredentials } finally { [Console]::SetOut($oldOut) }
-$stopFlag[0] = $true
-Start-Sleep -Milliseconds 150
-$ps.EndInvoke($handle) | Out-Null
-$ps.Dispose(); $rs.Close()
-Write-Host "`r                    " 
+Stop-Spinner -ctx $_loadCtx
 
 # -- Check for saved state -------------------------------------
 $existingState = Load-State
@@ -852,7 +819,7 @@ if ($resumeAction -eq "resume") {
     Write-Host ""
     $rBucket = $existingState.S3Bucket; $rKey = $existingState.S3Key
     if (-not $rBucket -or -not $rKey) {
-        Write-Status "S3 info missing -- re-fetching..." "Yellow"
+        Write-Host "  S3 info missing -- re-fetching..." -ForegroundColor Yellow
         $rf = if ($existingState.TargetVariant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
         $rBucket = $rf.S3Bucket; $rKey = $rf.S3Key
         if (-not $existingState.TargetVersion) { $existingState.TargetVersion = $rf.Version }
@@ -890,8 +857,8 @@ switch -Wildcard ($action) {
     }
     "*Gaming*" {
         if ($action -like "*not available*") {
-            Write-Status "Gaming driver is not supported on $($info.GpuName)." "Red"
-            Write-Status "Supported GPUs: T4, A10G, L4, L40S (standard instances only)." "Yellow"
+            Write-Host "  Gaming driver is not supported on $($info.GpuName)." -ForegroundColor Red
+            Write-Host "  Supported GPUs: T4, A10G, L4, L40S (standard instances only)." -ForegroundColor Yellow
         } else {
             $s3 = $online.LatestGaming
             Save-State @{ Step="FRESH"; TargetVariant="Gaming"; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
@@ -903,6 +870,6 @@ switch -Wildcard ($action) {
         Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$info.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
         Invoke-FullInstall -TargetVariant $info.Variant -Version $info.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
     }
-    default             { Write-Status "No action taken." "DarkGray" }
+    default             { Write-Host "  No action taken." -ForegroundColor DarkGray }
 }
 
