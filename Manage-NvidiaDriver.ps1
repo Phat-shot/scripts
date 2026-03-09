@@ -176,6 +176,23 @@ function Clear-State {
     Write-Log "State and resume task cleared." -Level "INFO"
 }
 
+function Invoke-Cleanup {
+    # Remove Downloads folder
+    try {
+        if (Test-Path $DownloadDir) {
+            Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Downloads folder removed." -Level "INFO"
+        }
+    } catch { Write-Log "Download cleanup: $_" -Level "INFO" }
+    # Schedule script self-deletion after exit (cmd /c ping delay trick)
+    $script = $MyInvocation.ScriptName
+    if ($script -and (Test-Path $script)) {
+        $del = "ping -n 3 127.0.0.1 > nul & del /f /q `"$script`""
+        Start-Process "cmd.exe" -ArgumentList "/c $del" -WindowStyle Hidden
+        Write-Log "Script queued for deletion: $script" -Level "INFO"
+    }
+}
+
 function Clear-Downloads {
     if (Test-Path $DownloadDir) {
         Remove-Item "$DownloadDir\*" -Force -ErrorAction SilentlyContinue
@@ -429,7 +446,7 @@ function Invoke-NvidiaUninstall {
     Get-Item "$env:SystemRoot\System32\DriverStore\FileRepository\nv*" -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "Green"
+    Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "DarkCyan"
     [Console]::Out.Flush()
     Write-Host ""
     Write-Log "Uninstall complete" -Level "OK"
@@ -477,11 +494,11 @@ function Get-DriverPackage {
 
     $dest = "$DownloadDir\$(Split-Path $S3Key -Leaf)"
     if (Test-Path $dest) {
-        Write-Host "  Using cached installer: $(Split-Path $dest -Leaf)" -ForegroundColor Green
+        Write-Host "  Using cached installer: $(Split-Path $dest -Leaf)" -ForegroundColor White
         return $dest
     }
 
-    Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkGray
+    Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkCyan
     $tmpDest = $dest + ".part"
     try {
         # Get file size for progress bar (background job so main thread stays free)
@@ -552,7 +569,7 @@ function Get-DriverPackage {
         $sizeMB  = [math]::Round((Get-Item $dest).Length / 1MB, 0)
         $fullBar = ([char]0x2588).ToString() * 30
         $pad = " " * 20
-        Write-Host "`r  100%  $fullBar  $sizeMB MB  $pad" -ForegroundColor Green
+        Write-Host "`r  100%  $fullBar  $sizeMB MB  $pad" -ForegroundColor DarkCyan
         Write-Host ""
         Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
         return $dest
@@ -609,7 +626,7 @@ function Install-NvidiaControlPanel {
         Write-Log "Control Panel install warning: $_" -Level "INFO"
     }
     Stop-Spinner -ctx $spinCtx -Done $(if($ok){"Control Panel installed."}else{"Control Panel install skipped."}) `
-        -Color $(if($ok){"Green"}else{"DarkGray"})
+        -Color $(if($ok){"DarkCyan"}else{"DarkGray"})
     [Console]::Out.Flush()
     # Return via script-scoped var to avoid bool leaking to pipeline
     $script:_cpResult = $ok
@@ -624,7 +641,7 @@ function Install-NvidiaDriver {
     Write-Log "Silent install started: $(Split-Path $InstallerPath -Leaf) [$Variant]" -Level "INFO"
     $argList = @("-s","-noreboot","-clean")
     if ($Variant -eq "GRID") { $argList += "-noeula" }
-    $color = if($Variant -eq "Gaming"){"Magenta"}else{"Cyan"}
+    $color = "DarkCyan"
     $spinCtx = Start-Spinner -Label "Installing $Variant driver"
     try {
         # Use PassThru without -Wait so the spinner runspace keeps running
@@ -696,8 +713,8 @@ function Step-ShowStatus {
         Write-Log "No NVIDIA driver detected" -Level "WARN"
         return $info
     }
-    $vc = switch ($info.Variant) { "Gaming"{"Magenta"} "GRID"{"Cyan"} default{"Gray"} }
-    Write-Host "  $($info.GpuName)" -ForegroundColor White
+    $vc = "DarkCyan"
+    Write-Host "  $($info.GpuName)" -ForegroundColor DarkCyan
     Write-Host "  $($info.Variant) $($info.Version)" -ForegroundColor $vc
     Write-Host ""
     Write-Log "GPU: $($info.GpuName) | Driver: $($info.Version) | Variant: $($info.Variant) | Date: $($info.DriverDate)" -Level "INFO"
@@ -723,7 +740,7 @@ function Step-CheckOnline {
     } elseif ($updateAvailable) {
         Write-Host "  $([char]0x2191) $($info.Variant) $updateVersion available" -ForegroundColor Yellow
     } else {
-        Write-Host "  $([char]0x2713) Current $($info.Variant) driver is up to date." -ForegroundColor Green
+        Write-Host "  $([char]0x2713) Current $($info.Variant) driver is up to date." -ForegroundColor White
     }
     Write-Host ""
     return @{ UpdateAvailable=$updateAvailable; LatestGaming=$latestGaming; LatestGrid=$latestGrid }
@@ -742,13 +759,16 @@ function Step-ActionMenu {
                 $opts += "Switch to Gaming / GeForce driver"
             }
         } else {
-            Write-Host "  [i] $($info.GpuName) supports GRID only -- Gaming driver not available for this GPU." -ForegroundColor DarkGray
+            Write-Host "  [i] $($info.GpuName) supports GRID only -- Gaming driver not available for this GPU." -ForegroundColor DarkCyan
         }
     }
     if (-not $online.UpdateAvailable) { $opts += "Reinstall current driver  ($($info.Version))" }
-    $opts += "Show status only  (no changes)"
     $sel = Prompt-Menu "What would you like to do?" $opts
-    if ($sel -eq 0) { Write-Host "  Cancelled." -ForegroundColor DarkGray; return $null }
+    if ($sel -eq 0) {
+        Write-Host "  Cancelled." -ForegroundColor White
+        Invoke-Cleanup
+        return $null
+    }
     return $opts[$sel - 1]
 }
 
@@ -789,7 +809,7 @@ function Invoke-FullInstall {
     # -- STEP 1: PRE-FLIGHT + DOWNLOAD ------------------------
     if ($state.Step -notin @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP")) {
         Write-Host ""
-        Write-Host "  Checking prerequisites..." -ForegroundColor DarkGray
+        Write-Host "  Checking prerequisites..." -ForegroundColor DarkCyan
         $disk = Get-PSDrive ((Split-Path $DownloadDir -Qualifier).TrimEnd(":")) -ErrorAction SilentlyContinue
         if ($disk -and $disk.Free -lt 2GB) {
             Write-Host "  ERROR: Not enough disk space ($([math]::Round($disk.Free/1GB,1)) GB free, need 2 GB)" -ForegroundColor Red
@@ -851,15 +871,12 @@ function Invoke-FullInstall {
             if ($state.TargetVariant -eq "Gaming") { Set-GamingLicense }
             Install-NvidiaControlPanel | Out-Null
             Clear-State
-            # Cleanup: remove downloaded installer + downloads folder
-            try {
-                if (Test-Path $DownloadDir) { Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue }
-                Write-Log "Downloads cleaned up" -Level "INFO"
-            } catch { Write-Log "Cleanup warning: $_" -Level "INFO" }
+            # Cleanup: remove downloads + self-delete script
+            Invoke-Cleanup
             # Remove script (EXE will re-download fresh next run)
             $selfScript = $MyInvocation.ScriptName
             Write-Host ""
-            Write-Host "  Done. Driver installed successfully." -ForegroundColor Green
+            Write-Host "  Done. Driver installed successfully." -ForegroundColor White
             Write-Host "  Log: $LogFile" -ForegroundColor DarkGray
             Write-Host ""
             Write-Log "Installation completed successfully. Downloads cleaned." -Level "OK"
@@ -954,11 +971,11 @@ if ($isResume) {
         default                      { $existingState.Step }
     }
     Write-Host ""
-    Write-Host "  Resuming: " -NoNewline -ForegroundColor Yellow
+    Write-Host "  Resuming: " -NoNewline -ForegroundColor DarkCyan
     Write-Host $stepDesc -ForegroundColor White
     Write-Log "Resuming from step: $($existingState.Step)" -Level "INFO"
     # Show target info from state (live GPU query unreliable after uninstall)
-    $vc = switch ($existingState.TargetVariant) { "Gaming"{"Magenta"} "GRID"{"Cyan"} default{"Gray"} }
+    $vc = "DarkCyan"
     Write-Host "  Installing: " -NoNewline -ForegroundColor DarkGray
     Write-Host "$($existingState.TargetVariant) $($existingState.TargetVersion)" -ForegroundColor $vc
     Write-Host ""
@@ -1019,6 +1036,6 @@ switch -Wildcard ($action) {
         Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$info.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
         Invoke-FullInstall -TargetVariant $info.Variant -Version $info.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
     }
-    default             { Write-Host "  No action taken." -ForegroundColor DarkGray }
+    default             { Write-Host "  No action taken." -ForegroundColor White }
 }
 
