@@ -574,20 +574,22 @@ function Install-NvidiaControlPanel {
     $ok = $false
     try {
         # Preferred: winget (available on Win11, silent)
-        $wg = Get-Command winget -ErrorAction SilentlyContinue
-        if ($wg) {
-            $proc = Start-Process -FilePath "winget" `
-                -ArgumentList @("install","--id","9NF8H0H7WMLT","--source","msstore",
-                               "--accept-package-agreements","--accept-source-agreements",
-                               "--silent","--disable-interactivity") `
-                -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\winget_cp.txt" -RedirectStandardError "$env:TEMP\winget_cp_err.txt"
-            while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
-            $ok = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335189)  # -1978335189 = already installed
+        $wgCmd = Get-Command winget -ErrorAction SilentlyContinue
+        if ($wgCmd) {
+            # Run winget fully hidden via cmd.exe to suppress all console output
+            $wgArgs = "install --id 9NF8H0H7WMLT --source msstore" +
+                      " --accept-package-agreements --accept-source-agreements" +
+                      " --silent --disable-interactivity"
+            $wgLog = "$env:TEMP\winget_cp_$([System.IO.Path]::GetRandomFileName()).log"
+            $proc = Start-Process -FilePath "cmd.exe" `
+                -ArgumentList @("/c", "winget $wgArgs > `"$wgLog`" 2>&1") `
+                -PassThru -WindowStyle Hidden -Wait
+            $ok = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335189)
             Write-Log "winget NVIDIA Control Panel: ExitCode $($proc.ExitCode)" -Level "INFO"
-            Remove-Item "$env:TEMP\winget_cp.txt","$env:TEMP\winget_cp_err.txt" -ErrorAction SilentlyContinue
+            Remove-Item $wgLog -ErrorAction SilentlyContinue
         }
         # Fallback: direct MSIX download from Store CDN (only if winget not available)
-        if (-not $ok -and -not $wg) {
+        if (-not $ok -and -not $wgCmd) {
             $uri = "https://store.rg-adguard.net/api/GetFiles?type=PackageFamilyName&url=NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj&ring=Retail&lang=en-US"
             $links = (Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30 -ErrorAction SilentlyContinue).Links |
                 Where-Object { $_.href -match "\.msixbundle|\.appxbundle" -and $_.href -notmatch "blockmap" } |
