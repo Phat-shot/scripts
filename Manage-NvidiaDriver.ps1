@@ -567,6 +567,51 @@ function Get-DriverPackage {
 # -------------------------------------------------------------
 #  INSTALL
 # -------------------------------------------------------------
+function Install-NvidiaControlPanel {
+    # Install NVIDIA Control Panel from the Microsoft Store (msix bundle)
+    # Product ID: 9NF8H0H7WMLT
+    Write-Log "Installing NVIDIA Control Panel from Store" -Level "INFO"
+    $spinCtx = Start-Spinner -Label "Installing NVIDIA Control Panel"
+    $ok = $false
+    try {
+        # Preferred: winget (available on Win11, silent)
+        $wg = Get-Command winget -ErrorAction SilentlyContinue
+        if ($wg) {
+            $proc = Start-Process -FilePath "winget" `
+                -ArgumentList @("install","--id","9NF8H0H7WMLT","--source","msstore",
+                               "--accept-package-agreements","--accept-source-agreements",
+                               "--silent","--disable-interactivity") `
+                -PassThru -NoNewWindow
+            while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
+            $ok = $proc.ExitCode -eq 0
+            Write-Log "winget install NVIDIA Control Panel: ExitCode $($proc.ExitCode)" -Level "INFO"
+        }
+        # Fallback: direct MSIX download from Store CDN
+        if (-not $ok) {
+            $uri = "https://store.rg-adguard.net/api/GetFiles?type=PackageFamilyName&url=NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj&ring=Retail&lang=en-US"
+            $links = (Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30 -ErrorAction SilentlyContinue).Links |
+                Where-Object { $_.href -match "\.msixbundle|\.appxbundle" -and $_.href -notmatch "blockmap" } |
+                Select-Object -First 1
+            if ($links) {
+                $msix = Join-Path $env:TEMP "NvidiaCP.msixbundle"
+                Invoke-WebRequest -Uri $links.href -OutFile $msix -UseBasicParsing -TimeoutSec 120 -ErrorAction SilentlyContinue
+                if (Test-Path $msix) {
+                    Add-AppxPackage -Path $msix -ErrorAction SilentlyContinue
+                    $ok = $?
+                    Remove-Item $msix -ErrorAction SilentlyContinue
+                    Write-Log "MSIX bundle install result: $ok" -Level "INFO"
+                }
+            }
+        }
+    } catch {
+        Write-Log "Control Panel install warning: $_" -Level "WARN"
+    }
+    Stop-Spinner -ctx $spinCtx -Done $(if($ok){"Control Panel installed."}else{"Control Panel install skipped."}) `
+        -Color $(if($ok){"Green"}else{"DarkGray"})
+    [Console]::Out.Flush()
+    return $ok
+}
+
 function Install-NvidiaDriver {
     param([string]$InstallerPath, [string]$Variant)
     if (-not $InstallerPath -or -not (Test-Path $InstallerPath)) {
@@ -797,6 +842,7 @@ function Invoke-FullInstall {
 
         if ($ok) {
             if ($state.TargetVariant -eq "Gaming") { Set-GamingLicense }
+            Install-NvidiaControlPanel
             Clear-State
             # Cleanup: remove downloaded installer + downloads folder
             try {
