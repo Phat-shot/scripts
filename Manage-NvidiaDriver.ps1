@@ -135,10 +135,10 @@ function Set-AwsCredentials {
                 Set-AWSCredential -AccessKey $key -SecretKey $secret -ErrorAction Stop
                 Write-Log "AWS credentials loaded from file (session scope)" -Level "INFO"
             } else {
-                Write-Log "Credentials file found but key/secret missing -- falling back to IAM role" -Level "WARN"
+                Write-Log "Credentials file found but key/secret missing -- falling back to IAM role" -Level "INFO"
             }
         } catch {
-            Write-Log "AWS credentials file error: $_" -Level "WARN"
+            Write-Log "AWS credentials file error: $_" -Level "INFO"
         }
     } else {
         Write-Log "No credentials file -- using IAM instance role" -Level "INFO"
@@ -164,7 +164,7 @@ function Load-State {
             $ht = @{}
             $json.PSObject.Properties | ForEach-Object { $ht[$_.Name] = $_.Value }
             return $ht
-        } catch { Write-Log "Could not load state: $_" -Level "WARN" }
+        } catch { Write-Log "Could not load state: $_" -Level "INFO" }
     }
     return $null
 }
@@ -314,10 +314,10 @@ function Get-S3DriverInfo {
         if ($exe -and (Split-Path $exe.Key -Leaf) -match '(\d+\.\d+)') {
             return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$Bucket; Error=$false }
         }
-        Write-Log "S3 lookup: no .exe found in $Bucket/$Prefix" -Level "WARN"
+        Write-Log "S3 lookup: no .exe found in $Bucket/$Prefix" -Level "INFO"
         return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$false }
     } catch {
-        Write-Log "S3 lookup failed ($Bucket): $_" -Level "WARN"
+        Write-Log "S3 lookup failed ($Bucket): $_" -Level "INFO"
         return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$true }
     }
 }
@@ -385,7 +385,7 @@ function Invoke-NvidiaUninstall {
                 $exe = [regex]::Match($app.UninstallString, '"?([^"]+\.exe)"?').Groups[1].Value
                 if ($exe -and (Test-Path $exe)) { $proc = Start-Process $exe -ArgumentList "-s -noreboot" -PassThru -NoNewWindow; if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } } }
             }
-        } catch { Write-Log "Failed to uninstall '$($app.DisplayName)': $_" -Level "WARN" }
+        } catch { Write-Log "Failed to uninstall '$($app.DisplayName)': $_" -Level "INFO" }
     }
 
     # NVI2.EXE / setup.exe for display driver
@@ -401,7 +401,7 @@ function Invoke-NvidiaUninstall {
         try {
             $setupProc = Start-Process $setup.FullName -ArgumentList "-s -noreboot -clean" -PassThru -NoNewWindow
             while (-not $setupProc.HasExited) { Start-Sleep -Milliseconds 500 }
-        } catch { Write-Log "Display driver uninstall failed: $_" -Level "WARN" }
+        } catch { Write-Log "Display driver uninstall failed: $_" -Level "INFO" }
     } else {
         $list = pnputil /enum-drivers 2>&1
         [regex]::Matches($list, 'oem\d+\.inf') | Select-Object -ExpandProperty Value -Unique | ForEach-Object {
@@ -606,7 +606,7 @@ function Install-NvidiaControlPanel {
             }
         }
     } catch {
-        Write-Log "Control Panel install warning: $_" -Level "WARN"
+        Write-Log "Control Panel install warning: $_" -Level "INFO"
     }
     Stop-Spinner -ctx $spinCtx -Done $(if($ok){"Control Panel installed."}else{"Control Panel install skipped."}) `
         -Color $(if($ok){"Green"}else{"DarkGray"})
@@ -654,13 +654,13 @@ function Set-GamingLicense {
         if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
         New-ItemProperty -Path $p -Name "vGamingMarketplace" -PropertyType DWord -Value 2 -Force | Out-Null
         Write-Log "Gaming license: vGamingMarketplace=2 set" -Level "OK"
-    } catch { Write-Log "Gaming registry key failed: $_" -Level "WARN" }
+    } catch { Write-Log "Gaming registry key failed: $_" -Level "INFO" }
     try {
         Invoke-WebRequest -Uri "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCertWindows_2024_02_22.cert" `
             -OutFile "$env:PUBLIC\Documents\GridSwCert.txt" -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
         Write-Log "Gaming cert downloaded" -Level "OK"
     } catch {
-        Write-Log "Gaming cert download failed (licensing may not work): $_" -Level "WARN"
+        Write-Log "Gaming cert download failed (licensing may not work): $_" -Level "INFO"
     }
 }
 
@@ -855,7 +855,7 @@ function Invoke-FullInstall {
             try {
                 if (Test-Path $DownloadDir) { Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue }
                 Write-Log "Downloads cleaned up" -Level "INFO"
-            } catch { Write-Log "Cleanup warning: $_" -Level "WARN" }
+            } catch { Write-Log "Cleanup warning: $_" -Level "INFO" }
             # Remove script (EXE will re-download fresh next run)
             $selfScript = $MyInvocation.ScriptName
             Write-Host ""
