@@ -1,9 +1,0 @@
-Install-Module ps2exe -Force -AllowClobber
-Invoke-PS2EXE `
-    -InputFile  "C:\Program Files\airgpu\Launch-NvidiaDriverManager.ps1" `
-    -OutputFile "C:\Program Files\airgpu\airgpu-driver-manager.exe" `
-    -IconFile   "C:\Program Files\airgpu\airgpu.ico" `
-    -Title      "airgpu Driver Manager" `
-    -Description "NVIDIA Driver Manager for airgpu" `
-    -Company    "airgpu" `
-    -requireAdmin
