@@ -82,6 +82,34 @@ function Stop-Spinner {
 
 
 # -------------------------------------------------------------
+#  RUN WITH SPINNER
+#  Runs a ScriptBlock in a Job (separate process, inherits module
+#  state), shows spinner on main thread, returns result via temp file.
+# -------------------------------------------------------------
+function Invoke-WithSpinner {
+    param([string]$Label, [scriptblock]$ScriptBlock, [object[]]$ArgumentList = @())
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    $job = Start-Job -ScriptBlock {
+        param($sb, $args, $out)
+        try {
+            Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+            $result = & ([scriptblock]::Create($sb)) @args
+            $result | ConvertTo-Json -Depth 5 | Set-Content $out -Encoding UTF8
+        } catch {
+            @{ Error = $_.ToString() } | ConvertTo-Json | Set-Content $out -Encoding UTF8
+        }
+    } -ArgumentList $ScriptBlock.ToString(), $ArgumentList, $tmpFile
+    $spinCtx = Start-Spinner -Label $Label
+    while ($job.State -eq "Running") { Start-Sleep -Milliseconds 150 }
+    Stop-Spinner -ctx $spinCtx
+    Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job $job -ErrorAction SilentlyContinue
+    $raw = Get-Content $tmpFile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpFile -ErrorAction SilentlyContinue
+    if ($raw) { return $raw | ConvertFrom-Json } else { return $null }
+}
+
+# -------------------------------------------------------------
 #  AWS CREDENTIALS
 #  Uses SharedCredentialsFile explicitly to avoid conflict with
 #  empty NetSDKCredentialsFile profile of the same name.
@@ -455,9 +483,24 @@ function Get-DriverPackage {
 
     $tmpDest = $dest + ".part"
     try {
-        # Get file size for progress bar
-        $meta  = Get-S3ObjectMetadata -BucketName $S3Bucket -Key $S3Key -Region "us-east-1" -ErrorAction SilentlyContinue
-        $total = if ($meta) { $meta.ContentLength } else { 0 }
+        # Get file size for progress bar (background job so main thread stays free)
+        $metaJob = Start-Job -ScriptBlock {
+            param($b,$k,$f)
+            Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+            try {
+                $kvp=@{}; Get-Content $f -ErrorAction SilentlyContinue | Where-Object { $_ -match "=" } | ForEach-Object {
+                    $p=$_ -split "\s*=\s*",2; if($p.Count -eq 2){$kvp[$p[0].Trim()]=$p[1].Trim()}
+                }
+                if($kvp["aws_access_key_id"]){Set-AWSCredential -AccessKey $kvp["aws_access_key_id"] -SecretKey $kvp["aws_secret_access_key"] -ErrorAction SilentlyContinue}
+                Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
+                $m = Get-S3ObjectMetadata -BucketName $b -Key $k -Region "us-east-1" -ErrorAction SilentlyContinue
+                if ($m) { return $m.ContentLength } else { return 0 }
+            } catch { return 0 }
+        } -ArgumentList $S3Bucket, $S3Key, $AwsCredsFile
+        while ($metaJob.State -eq "Running") { Start-Sleep -Milliseconds 100 }
+        $total = [long](Receive-Job $metaJob -ErrorAction SilentlyContinue)
+        Remove-Job $metaJob -ErrorAction SilentlyContinue
+        if (-not $total) { $total = 0 }
 
         # Progress bar runs in a runspace, polling file size every 300ms
         # Copy-S3Object runs in the main thread so credentials are available
@@ -593,7 +636,9 @@ function Request-Reboot {
 #  STATUS + ONLINE CHECK
 # -------------------------------------------------------------
 function Step-ShowStatus {
-    $info = Get-InstalledNvidiaInfo
+    $spinCtx = Start-Spinner -Label "Detecting GPU"
+    $info    = Get-InstalledNvidiaInfo
+    Stop-Spinner -ctx $spinCtx
     if (-not $info.Installed) {
         Write-Host "  No NVIDIA driver detected." -ForegroundColor Red
         Write-Log "No NVIDIA driver detected" -Level "WARN"
@@ -609,21 +654,50 @@ function Step-ShowStatus {
 
 function Step-CheckOnline {
     param($info)
+    # Run both S3 fetches as parallel background jobs so spinner stays live
+    # Read credentials to pass explicitly into jobs (jobs are separate processes)
+    $jobCreds = @{ File=$AwsCredsFile }
+    $s3JobSb = {
+        param($bucket, $prefix, $credsFile)
+        Import-Module AWSPowerShell -ErrorAction SilentlyContinue
+        try {
+            if (Test-Path $credsFile) {
+                $kvp = @{}; Get-Content $credsFile | Where-Object { $_ -match "=" } | ForEach-Object {
+                    $p = $_ -split "\s*=\s*", 2; if ($p.Count -eq 2) { $kvp[$p[0].Trim()] = $p[1].Trim() }
+                }
+                if ($kvp["aws_access_key_id"]) { Set-AWSCredential -AccessKey $kvp["aws_access_key_id"] -SecretKey $kvp["aws_secret_access_key"] -ErrorAction SilentlyContinue }
+            }
+            Set-DefaultAWSRegion -Region "us-east-1" -ErrorAction SilentlyContinue
+            $exe = Get-S3Object -BucketName $bucket -KeyPrefix $prefix -Region "us-east-1" -ErrorAction Stop |
+                Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
+            if ($exe -and (Split-Path $exe.Key -Leaf) -match "(\d+\.\d+)") {
+                return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$bucket; Error=$false }
+            }
+            return @{ Version="Unknown"; S3Key=""; S3Bucket=$bucket; Error=$false }
+        } catch {
+            return @{ Version="Unknown"; S3Key=""; S3Bucket=$bucket; Error=$true }
+        }
+    }
+    $jobGaming = Start-Job -ScriptBlock $s3JobSb -ArgumentList "nvidia-gaming",          "windows/latest/", $AwsCredsFile
+    $jobGrid   = Start-Job -ScriptBlock $s3JobSb -ArgumentList "ec2-windows-nvidia-drivers", "latest/",     $AwsCredsFile
     $spinCtx = Start-Spinner -Label "Checking for updates"
-    # Fetch current variant first; other is retrieved lazily (both are cached after first call)
-    $latestSame  = if ($info.Variant -eq "GRID") { Get-LatestGridVersion }   else { Get-LatestGamingVersion }
-    $latestOther = if ($info.Variant -eq "GRID") { Get-LatestGamingVersion } else { Get-LatestGridVersion }
-    $latestGaming = if ($info.Variant -eq "Gaming") { $latestSame } else { $latestOther }
-    $latestGrid   = if ($info.Variant -eq "GRID")   { $latestSame } else { $latestOther }
-    $updateAvailable = $false
-    $updateVersion   = ""
+    while ($jobGaming.State -eq "Running" -or $jobGrid.State -eq "Running") { Start-Sleep -Milliseconds 150 }
+    Stop-Spinner -ctx $spinCtx
+    $latestGaming = Receive-Job $jobGaming -ErrorAction SilentlyContinue
+    $latestGrid   = Receive-Job $jobGrid   -ErrorAction SilentlyContinue
+    Remove-Job $jobGaming, $jobGrid -ErrorAction SilentlyContinue
+    if (-not $latestGaming) { $latestGaming = @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$true } }
+    if (-not $latestGrid)   { $latestGrid   = @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$true } }
+    # Update session cache
+    $script:S3CacheGaming = $latestGaming
+    $script:S3CacheGrid   = $latestGrid
+    $updateAvailable = $false; $updateVersion = ""
     try {
-        $latest = $latestSame.Version
-        if ([Version]$latest -gt [Version]$info.Version) {
+        $latest = if ($info.Variant -eq "GRID") { $latestGrid.Version } else { $latestGaming.Version }
+        if ($latest -ne "Unknown" -and [Version]$latest -gt [Version]$info.Version) {
             $updateAvailable = $true; $updateVersion = $latest
         }
     } catch {}
-    Stop-Spinner -ctx $spinCtx
     Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
     $s3err = ($latestGaming.Error -and $info.Variant -eq "Gaming") -or ($latestGrid.Error -and $info.Variant -eq "GRID")
     if ($s3err) {
