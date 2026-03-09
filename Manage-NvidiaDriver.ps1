@@ -580,13 +580,14 @@ function Install-NvidiaControlPanel {
                 -ArgumentList @("install","--id","9NF8H0H7WMLT","--source","msstore",
                                "--accept-package-agreements","--accept-source-agreements",
                                "--silent","--disable-interactivity") `
-                -PassThru -NoNewWindow
+                -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\winget_cp.txt" -RedirectStandardError "$env:TEMP\winget_cp_err.txt"
             while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
-            $ok = $proc.ExitCode -eq 0
-            Write-Log "winget install NVIDIA Control Panel: ExitCode $($proc.ExitCode)" -Level "INFO"
+            $ok = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335189)  # -1978335189 = already installed
+            Write-Log "winget NVIDIA Control Panel: ExitCode $($proc.ExitCode)" -Level "INFO"
+            Remove-Item "$env:TEMP\winget_cp.txt","$env:TEMP\winget_cp_err.txt" -ErrorAction SilentlyContinue
         }
-        # Fallback: direct MSIX download from Store CDN
-        if (-not $ok) {
+        # Fallback: direct MSIX download from Store CDN (only if winget not available)
+        if (-not $ok -and -not $wg) {
             $uri = "https://store.rg-adguard.net/api/GetFiles?type=PackageFamilyName&url=NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj&ring=Retail&lang=en-US"
             $links = (Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30 -ErrorAction SilentlyContinue).Links |
                 Where-Object { $_.href -match "\.msixbundle|\.appxbundle" -and $_.href -notmatch "blockmap" } |
@@ -608,7 +609,8 @@ function Install-NvidiaControlPanel {
     Stop-Spinner -ctx $spinCtx -Done $(if($ok){"Control Panel installed."}else{"Control Panel install skipped."}) `
         -Color $(if($ok){"Green"}else{"DarkGray"})
     [Console]::Out.Flush()
-    return $ok
+    # Return via script-scoped var to avoid bool leaking to pipeline
+    $script:_cpResult = $ok
 }
 
 function Install-NvidiaDriver {
@@ -633,7 +635,7 @@ function Install-NvidiaDriver {
             Write-Log "Driver installed successfully (ExitCode: $($proc.ExitCode))" -Level "OK"
             return $true
         }
-        Write-Log "Driver installer exited with non-zero code: $($proc.ExitCode)" -Level "WARN"
+        Write-Log "Driver installer exited with non-zero code: $($proc.ExitCode) (treated as success)" -Level "INFO"
         return $true
     } catch {
         Stop-Spinner -ctx $spinCtx
@@ -845,7 +847,7 @@ function Invoke-FullInstall {
 
         if ($ok) {
             if ($state.TargetVariant -eq "Gaming") { Set-GamingLicense }
-            Install-NvidiaControlPanel
+            Install-NvidiaControlPanel | Out-Null
             Clear-State
             # Cleanup: remove downloaded installer + downloads folder
             try {
