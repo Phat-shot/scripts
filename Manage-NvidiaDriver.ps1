@@ -336,7 +336,7 @@ function Test-GamingDriverSupported {
     if ($GpuName -match '(?i)\bT4\b')                                             { return $true }
     if ($GpuName -match '(?i)\bA10G\b')                                           { return $true }
     if ($GpuName -match '(?i)\bL40S\b')                                           { return $true }
-    if ($GpuName -match '(?i)\bL4\b' -and $GpuName -notmatch '(?i)\bL4[a-z]+') { return $true }
+    if ($GpuName -match '(?i)\bL4\b' -and $GpuName -notmatch '(?i)\bL4[-a-zA-Z0-9]') { return $true }
     return $false
 }
 
@@ -469,11 +469,10 @@ function Get-DriverPackage {
     if (-not (Test-Path $DownloadDir)) { New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null }
 
     if (-not $S3Bucket -or -not $S3Key) {
-        Write-Host "  No S3 source available. Enter installer path manually (empty = cancel):" -ForegroundColor Yellow
-        $manual = (Read-Host "  Path").Trim('"').Trim()
-        if ($manual -and (Test-Path $manual)) { return $manual }
-        Write-Log "No installer source available" -Level "ERROR"
-        return ""
+        Write-Host "  Cannot proceed: S3 source not available and no cached installer." -ForegroundColor Red
+        Write-Host "  Ensure AWS credentials or IAM role are configured and S3 is reachable." -ForegroundColor Yellow
+        Write-Log "Install aborted: no S3 source (no credentials/IAM role)" -Level "ERROR"
+        return
     }
 
     $dest = "$DownloadDir\$(Split-Path $S3Key -Leaf)"
@@ -733,7 +732,11 @@ function Step-ActionMenu {
     if ($info.Variant -eq "Gaming") { $opts += "Switch to GRID / Enterprise driver" }
     if ($info.Variant -eq "GRID") {
         if (Test-GamingDriverSupported -GpuName $info.GpuName) {
-            $opts += "Switch to Gaming / GeForce driver"
+            if ($online.LatestGaming.Error) {
+                $opts += "Switch to Gaming / GeForce driver  [S3 unavailable -- check credentials]"
+            } else {
+                $opts += "Switch to Gaming / GeForce driver"
+            }
         } else {
             $opts += "Switch to Gaming / GeForce driver  [not available for $($info.GpuName)]"
         }
@@ -925,6 +928,15 @@ if (-not $isResume) {
     Remove-Job $jobGaming, $jobGrid -ErrorAction SilentlyContinue
     if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version="Unknown"; S3Key=""; S3Bucket="nvidia-gaming"; Error=$true } }
     if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version="Unknown"; S3Key=""; S3Bucket="ec2-windows-nvidia-drivers"; Error=$true } }
+    # Warn early if S3 is unreachable -- likely missing credentials or IAM role
+    if ($script:S3CacheGaming.Error -and $script:S3CacheGrid.Error) {
+        Write-Host ""
+        Write-Host "  [!] Cannot reach AWS S3 -- driver downloads will not be available." -ForegroundColor Yellow
+        Write-Host "      Cause: missing credentials or IAM role lacks S3 read permission." -ForegroundColor DarkGray
+        Write-Host "      File:  C:\Users\user\.aws\credentials" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Log "S3 unreachable: both buckets failed -- no credentials or IAM role" -Level "WARN"
+    }
     # Load credentials into main session (module already imported in jobs)
     Set-AwsCredentials
 }
@@ -988,6 +1000,10 @@ switch -Wildcard ($action) {
         if ($action -like "*not available*") {
             Write-Host "  Gaming driver is not supported on $($info.GpuName)." -ForegroundColor Red
             Write-Host "  Supported GPUs: T4, A10G, L4, L40S (standard instances only)." -ForegroundColor Yellow
+        } elseif ($action -like "*check credentials*") {
+            Write-Host "  Cannot proceed: S3 is unreachable." -ForegroundColor Red
+            Write-Host "  Configure AWS credentials or IAM role with S3 read access." -ForegroundColor Yellow
+            Write-Host "  File: C:\Users\user\.aws\credentials" -ForegroundColor DarkGray
         } else {
             $s3 = $online.LatestGaming
             Save-State @{ Step="FRESH"; TargetVariant="Gaming"; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
