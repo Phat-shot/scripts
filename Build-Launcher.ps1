@@ -1,14 +1,15 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Compiles airgpu-driver-manager.exe -- self-contained launcher.
-    Downloads Manage-NvidiaDriver.ps1 from GitHub and runs it directly.
-    No separate PS1 launcher needed.
+    Intended to run in CI (GitHub Actions) or locally.
+    Icon is looked up relative to this script's directory.
 #>
+param(
+    [string]$OutDir   = "$PSScriptRoot\build",
+    [string]$IconPath = "$PSScriptRoot\airgpu.ico"
+)
 
-$OutDir   = "C:\Program Files\airgpu"
-$OutExe   = "$OutDir\airgpu-driver-manager.exe"
-$IconPath = "$OutDir\airgpu.ico"
+$OutExe = "$OutDir\airgpu-driver-manager.exe"
 
 # Find csc.exe
 $csc = Get-ChildItem "C:\Windows\Microsoft.NET\Framework64" -Filter "csc.exe" -Recurse -ErrorAction SilentlyContinue |
