@@ -304,7 +304,7 @@ function Prompt-Menu {
     Write-Host ""
     Write-Host "  $Title" -ForegroundColor Yellow
     for ($i = 0; $i -lt $Options.Count; $i++) {
-        $label = if ($Options[$i]) { [string]$Options[$i] } else { "(empty)" }
+        $label = if ($Options[$i]) { [string]$Options[$i] } else { '' }
         Write-Host "    [$($i+1)] $label"
     }
     Write-Host "    [0] Cancel / Exit"
