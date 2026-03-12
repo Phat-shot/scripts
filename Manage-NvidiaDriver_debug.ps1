@@ -136,7 +136,6 @@ function Get-AwsCreds {
         } catch {}
     }
     # 2. Try IMDSv2 instance role (no network penalty if it fails fast)
-    Write-Log "[TIMING] Trying IMDSv2..." -Level "INFO"
     try {
         $token = (Invoke-WebRequest -Uri 'http://169.254.169.254/latest/api/token' `
             -Method PUT -Headers @{'X-aws-ec2-metadata-token-ttl-seconds'='21600'} `
@@ -151,54 +150,9 @@ function Get-AwsCreds {
             Write-Log "AWS credentials loaded from IAM role: $role" -Level "INFO"
             return @{ Key=$j.AccessKeyId; Secret=$j.SecretAccessKey; Token=$j.Token }
         }
-    } catch { Write-Log "[TIMING] IMDSv2 failed/timeout" -Level "INFO" }
     Write-Log "No AWS credentials found (no file, no IAM role)" -Level "INFO"
     return $null
 }
-
-function Get-SigV4Headers {
-    param([string]$Method, [string]$Bucket, [string]$Path,
-          [string]$Query, [hashtable]$Creds)
-    $region  = 'us-east-1'
-    $service = 's3'
-    $host    = "$Bucket.s3.amazonaws.com"
-    $now     = [DateTime]::UtcNow
-    $amzDate = $now.ToString('yyyyMMddTHHmmssZ')
-    $date    = $now.ToString('yyyyMMdd')
-    $bodyHash= 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' # SHA256('')
-
-    $canonHeaders = "host:$host`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-    $signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
-    if ($Creds.Token) {
-        $canonHeaders  = "host:$host`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`nx-amz-security-token:$($Creds.Token)`n"
-        $signedHeaders = 'host;x-amz-content-sha256;x-amz-date;x-amz-security-token'
-    }
-
-    $canonReq  = "$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-    $scope     = "$date/$region/$service/aws4_request"
-    $strToSign = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canonReq)"
-
-    $sigKey = Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 `
-        ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) $service) 'aws4_request'
-    $sig    = [BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash(
-        [Text.Encoding]::UTF8.GetBytes($strToSign))).Replace('-','').ToLower()
-
-    $auth = "AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"
-    $hdrs = @{ 'x-amz-date'=$amzDate; 'x-amz-content-sha256'=$bodyHash; 'Authorization'=$auth }
-    if ($Creds.Token) { $hdrs['x-amz-security-token'] = $Creds.Token }
-    return $hdrs
-}
-
-function Get-SHA256 {
-    param([string]$s)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-}
-function Get-HmacSHA256 {
-    param([byte[]]$key, [string]$data)
-    (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-}
-
 
 # -------------------------------------------------------------
 #  STATE MANAGEMENT
@@ -379,12 +333,9 @@ function Get-InstalledNvidiaInfo {
 function Get-S3DriverInfo {
     param([string]$Bucket, [string]$Prefix)
     try {
-        $creds   = $script:AwsCreds
-        $query   = "list-type=2&prefix=$([Uri]::EscapeDataString($Prefix))&max-keys=20"
-        $url     = "https://$Bucket.s3.amazonaws.com/?$query"
-        $headers = @{}
-        if ($creds) { $headers = Get-SigV4Headers -Method 'GET' -Bucket $Bucket -Path '/' -Query "?$query" -Creds $creds }
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        $query = "list-type=2&prefix=$([Uri]::EscapeDataString($Prefix))&max-keys=20"
+        $url   = "https://$Bucket.s3.amazonaws.com/?$query"
+        $resp  = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         [xml]$xml = $resp.Content
         $key = $xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } |
                Select-Object -ExpandProperty Key -First 1
@@ -561,16 +512,11 @@ function Get-DriverPackage {
     Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkCyan
     $tmpDest = $dest + ".part"
     try {
-        $url     = "https://$S3Bucket.s3.amazonaws.com/$S3Key"
-        $headers = @{ 'User-Agent' = 'airgpu-driver-manager/1.0' }
-        if ($script:AwsCreds) {
-            $headers = Get-SigV4Headers -Method 'GET' -Bucket $S3Bucket `
-                -Path "/$S3Key" -Query '' -Creds $script:AwsCreds
-        }
+        $url = "https://$S3Bucket.s3.amazonaws.com/$S3Key"
 
         # HEAD request for file size
         try {
-            $head  = Invoke-WebRequest -Uri $url -Method HEAD -Headers $headers `
+            $head  = Invoke-WebRequest -Uri $url -Method HEAD `
                 -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             $total = [long]$head.Headers['Content-Length']
         } catch { $total = 0 }
@@ -604,7 +550,6 @@ function Get-DriverPackage {
         # Stream download directly -- no AWSPowerShell needed
         $req = [System.Net.HttpWebRequest]::Create($url)
         $req.Method  = 'GET'; $req.Timeout = 600000; $req.ReadWriteTimeout = 600000
-        foreach ($h in $headers.GetEnumerator()) { $req.Headers[$h.Key] = $h.Value }
         $resp   = $req.GetResponse()
         $stream = $resp.GetResponseStream()
         $fs     = [System.IO.File]::Create($tmpDest)
@@ -759,11 +704,9 @@ function Request-Reboot {
 #  STATUS + ONLINE CHECK
 # -------------------------------------------------------------
 function Step-ShowStatus {
-    Write-Log "[TIMING] Detecting GPU..." -Level "INFO"
     $spinCtx = Start-Spinner -Label "Detecting GPU"
     $info    = Get-InstalledNvidiaInfo
     Stop-Spinner -ctx $spinCtx
-    Write-Log "[TIMING] GPU detect done: $($info.GpuName)" -Level "INFO"
     if (-not $info.Installed) {
         Write-Host "  No NVIDIA driver detected." -ForegroundColor Red
         Write-Log "No NVIDIA driver detected" -Level "WARN"
@@ -849,39 +792,11 @@ function Invoke-FullInstall {
         $rsGaming.Open(); $rsGrid.Open()
 
         $fetchSb = {
-            param($bucket, $prefix, $creds)
-            function Get-SHA256 { param([string]$s)
-                $sha=[Security.Cryptography.SHA256]::Create()
-                [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-            }
-            function Get-HmacSHA256 { param([byte[]]$key,[string]$data)
-                (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-            }
-            function Get-SigV4Headers { param($Method,$Bucket,$Path,$Query,$Creds)
-                $region='us-east-1'; $now=[DateTime]::UtcNow
-                $amzDate=$now.ToString('yyyyMMddTHHmmssZ'); $date=$now.ToString('yyyyMMdd')
-                $bodyHash='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-                $canonHeaders="host:$Bucket.s3.amazonaws.com`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-                $signedHeaders='host;x-amz-content-sha256;x-amz-date'
-                if ($Creds.Token) {
-                    $canonHeaders+="x-amz-security-token:$($Creds.Token)`n"
-                    $signedHeaders+=';x-amz-security-token'
-                }
-                $canon="$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-                $scope="$date/$region/s3/aws4_request"
-                $sts="AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canon)"
-                $sigKey=Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) 's3') 'aws4_request'
-                $sig=[BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash([Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-                $h=@{'x-amz-date'=$amzDate;'x-amz-content-sha256'=$bodyHash;'Authorization'="AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"}
-                if ($Creds.Token) { $h['x-amz-security-token']=$Creds.Token }
-                return $h
-            }
+            param($bucket, $prefix, $credKey, $credSecret, $credToken)
             try {
                 $query="list-type=2&prefix=$([Uri]::EscapeDataString($prefix))&max-keys=20"
                 $url="https://$bucket.s3.amazonaws.com/?$query"
-                $headers=@{}
-                if ($creds) { $headers=Get-SigV4Headers -Method 'GET' -Bucket $bucket -Path '/' -Query "?$query" -Creds $creds }
-                $resp=Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                $resp=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
                 [xml]$xml=$resp.Content
                 $key=$xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
                 if ($key -and ($key -match '(\d+\.\d+)')) { return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$bucket; Error=$false } }
@@ -889,12 +804,15 @@ function Invoke-FullInstall {
             } catch { return @{ Version='Unknown'; S3Key=''; S3Bucket=$bucket; Error=$true; ErrorMsg=$_.ToString() } }
         }
 
+        $credKey    = if ($script:AwsCreds) { $script:AwsCreds.Key    } else { '' }
+        $credSecret = if ($script:AwsCreds) { $script:AwsCreds.Secret } else { '' }
+        $credToken  = if ($script:AwsCreds) { $script:AwsCreds.Token  } else { '' }
         $pshGaming = [System.Management.Automation.PowerShell]::Create()
         $pshGaming.Runspace = $rsGaming
-        $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($script:AwsCreds) | Out-Null
+        $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
         $pshGrid   = [System.Management.Automation.PowerShell]::Create()
         $pshGrid.Runspace = $rsGrid
-        $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($script:AwsCreds) | Out-Null
+        $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
 
         $_awsCtx    = Start-Spinner -Label "Loading"
         $hGaming    = $pshGaming.BeginInvoke()
@@ -1021,50 +939,19 @@ foreach ($dir in @($WorkDir,$DownloadDir)) {
 Show-Banner
 
 # -- Check for saved state (before loading AWS -- resume may not need S3) ----
-Write-Log "[TIMING] Script start" -Level "INFO"
 $existingState = Load-State
 $isResume = $existingState -and $existingState.Step -in @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP","UNINSTALLING")
 
 # -- Load credentials + prefetch S3 versions in parallel via runspaces --------
 if (-not $isResume) {
-    Write-Log "[TIMING] Getting AWS creds..." -Level "INFO"
     $script:AwsCreds = Get-AwsCreds
-    Write-Log "[TIMING] AWS creds done. Key=$(if($script:AwsCreds){'found'}else{'none'})" -Level "INFO"
 
     $fetchSb = {
-        param($bucket, $prefix, $creds)
-        function Get-SHA256 { param([string]$s)
-            $sha=[Security.Cryptography.SHA256]::Create()
-            [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-        }
-        function Get-HmacSHA256 { param([byte[]]$key,[string]$data)
-            (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-        }
-        function Get-SigV4Headers { param($Method,$Bucket,$Path,$Query,$Creds)
-            $region='us-east-1'; $now=[DateTime]::UtcNow
-            $amzDate=$now.ToString('yyyyMMddTHHmmssZ'); $date=$now.ToString('yyyyMMdd')
-            $bodyHash='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-            $canonHeaders="host:$Bucket.s3.amazonaws.com`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-            $signedHeaders='host;x-amz-content-sha256;x-amz-date'
-            if ($Creds -and $Creds.Token) {
-                $canonHeaders+="x-amz-security-token:$($Creds.Token)`n"
-                $signedHeaders+=';x-amz-security-token'
-            }
-            $canon="$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-            $scope="$date/$region/s3/aws4_request"
-            $sts="AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canon)"
-            $sigKey=Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) 's3') 'aws4_request'
-            $sig=[BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash([Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-            $h=@{'x-amz-date'=$amzDate;'x-amz-content-sha256'=$bodyHash;'Authorization'="AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"}
-            if ($Creds.Token) { $h['x-amz-security-token']=$Creds.Token }
-            return $h
-        }
+        param($bucket, $prefix, $credKey, $credSecret, $credToken)
         try {
             $query="list-type=2&prefix=$([Uri]::EscapeDataString($prefix))&max-keys=20"
             $url="https://$bucket.s3.amazonaws.com/?$query"
-            $headers=@{}
-            if ($creds) { $headers=Get-SigV4Headers -Method 'GET' -Bucket $bucket -Path '/' -Query "?$query" -Creds $creds }
-            $resp=Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            $resp=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             [xml]$xml=$resp.Content
             $key=$xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
             if ($key -and ($key -match '(\d+\.\d+)')) { return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$bucket; Error=$false } }
@@ -1076,28 +963,27 @@ if (-not $isResume) {
     $rsGrid   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rsGaming.Open(); $rsGrid.Open()
 
+    $credKey    = if ($script:AwsCreds) { $script:AwsCreds.Key    } else { '' }
+    $credSecret = if ($script:AwsCreds) { $script:AwsCreds.Secret } else { '' }
+    $credToken  = if ($script:AwsCreds) { $script:AwsCreds.Token  } else { '' }
+
     $pshGaming = [System.Management.Automation.PowerShell]::Create()
     $pshGaming.Runspace = $rsGaming
-    $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($script:AwsCreds) | Out-Null
+    $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
     $pshGrid = [System.Management.Automation.PowerShell]::Create()
     $pshGrid.Runspace = $rsGrid
-    $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($script:AwsCreds) | Out-Null
+    $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
 
-    Write-Log "[TIMING] Starting S3 runspaces..." -Level "INFO"
     $_loadCtx = Start-Spinner -Label "Loading"
     $hGaming  = $pshGaming.BeginInvoke()
     $hGrid    = $pshGrid.BeginInvoke()
     while (-not $hGaming.IsCompleted -or -not $hGrid.IsCompleted) { Start-Sleep -Milliseconds 100 }
     Stop-Spinner -ctx $_loadCtx
-    Write-Log "[TIMING] S3 runspaces done" -Level "INFO"
 
     $script:S3CacheGaming = $pshGaming.EndInvoke($hGaming)[0]
     $script:S3CacheGrid   = $pshGrid.EndInvoke($hGrid)[0]
     $pshGaming.Dispose(); $rsGaming.Close()
     $pshGrid.Dispose();   $rsGrid.Close()
-    Write-Log "[TIMING] S3 Gaming=$(if($script:S3CacheGaming.Error){'ERROR'}else{$script:S3CacheGaming.Version}) Grid=$(if($script:S3CacheGrid.Error){'ERROR'}else{$script:S3CacheGrid.Version})" -Level "INFO"
-    if ($script:S3CacheGaming.Error) { Write-Log "[TIMING] S3 Gaming error detail: $($script:S3CacheGaming.ErrorMsg)" -Level "INFO" }
-    if ($script:S3CacheGrid.Error)   { Write-Log "[TIMING] S3 Grid error detail: $($script:S3CacheGrid.ErrorMsg)" -Level "INFO" }
 
     if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version='Unknown'; S3Key=''; S3Bucket='nvidia-gaming'; Error=$true } }
     if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version='Unknown'; S3Key=''; S3Bucket='ec2-windows-nvidia-drivers'; Error=$true } }
@@ -1327,7 +1213,6 @@ function Get-AwsCreds {
         } catch {}
     }
     # 2. Try IMDSv2 instance role (no network penalty if it fails fast)
-    Write-Log "[TIMING] Trying IMDSv2..." -Level "INFO"
     try {
         $token = (Invoke-WebRequest -Uri 'http://169.254.169.254/latest/api/token' `
             -Method PUT -Headers @{'X-aws-ec2-metadata-token-ttl-seconds'='21600'} `
@@ -1342,54 +1227,9 @@ function Get-AwsCreds {
             Write-Log "AWS credentials loaded from IAM role: $role" -Level "INFO"
             return @{ Key=$j.AccessKeyId; Secret=$j.SecretAccessKey; Token=$j.Token }
         }
-    } catch { Write-Log "[TIMING] IMDSv2 failed/timeout" -Level "INFO" }
     Write-Log "No AWS credentials found (no file, no IAM role)" -Level "INFO"
     return $null
 }
-
-function Get-SigV4Headers {
-    param([string]$Method, [string]$Bucket, [string]$Path,
-          [string]$Query, [hashtable]$Creds)
-    $region  = 'us-east-1'
-    $service = 's3'
-    $host    = "$Bucket.s3.amazonaws.com"
-    $now     = [DateTime]::UtcNow
-    $amzDate = $now.ToString('yyyyMMddTHHmmssZ')
-    $date    = $now.ToString('yyyyMMdd')
-    $bodyHash= 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' # SHA256('')
-
-    $canonHeaders = "host:$host`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-    $signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
-    if ($Creds.Token) {
-        $canonHeaders  = "host:$host`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`nx-amz-security-token:$($Creds.Token)`n"
-        $signedHeaders = 'host;x-amz-content-sha256;x-amz-date;x-amz-security-token'
-    }
-
-    $canonReq  = "$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-    $scope     = "$date/$region/$service/aws4_request"
-    $strToSign = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canonReq)"
-
-    $sigKey = Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 `
-        ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) $service) 'aws4_request'
-    $sig    = [BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash(
-        [Text.Encoding]::UTF8.GetBytes($strToSign))).Replace('-','').ToLower()
-
-    $auth = "AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"
-    $hdrs = @{ 'x-amz-date'=$amzDate; 'x-amz-content-sha256'=$bodyHash; 'Authorization'=$auth }
-    if ($Creds.Token) { $hdrs['x-amz-security-token'] = $Creds.Token }
-    return $hdrs
-}
-
-function Get-SHA256 {
-    param([string]$s)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-}
-function Get-HmacSHA256 {
-    param([byte[]]$key, [string]$data)
-    (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-}
-
 
 # -------------------------------------------------------------
 #  STATE MANAGEMENT
@@ -1570,12 +1410,9 @@ function Get-InstalledNvidiaInfo {
 function Get-S3DriverInfo {
     param([string]$Bucket, [string]$Prefix)
     try {
-        $creds   = $script:AwsCreds
-        $query   = "list-type=2&prefix=$([Uri]::EscapeDataString($Prefix))&max-keys=20"
-        $url     = "https://$Bucket.s3.amazonaws.com/?$query"
-        $headers = @{}
-        if ($creds) { $headers = Get-SigV4Headers -Method 'GET' -Bucket $Bucket -Path '/' -Query "?$query" -Creds $creds }
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        $query = "list-type=2&prefix=$([Uri]::EscapeDataString($Prefix))&max-keys=20"
+        $url   = "https://$Bucket.s3.amazonaws.com/?$query"
+        $resp  = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         [xml]$xml = $resp.Content
         $key = $xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } |
                Select-Object -ExpandProperty Key -First 1
@@ -1752,16 +1589,11 @@ function Get-DriverPackage {
     Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkCyan
     $tmpDest = $dest + ".part"
     try {
-        $url     = "https://$S3Bucket.s3.amazonaws.com/$S3Key"
-        $headers = @{ 'User-Agent' = 'airgpu-driver-manager/1.0' }
-        if ($script:AwsCreds) {
-            $headers = Get-SigV4Headers -Method 'GET' -Bucket $S3Bucket `
-                -Path "/$S3Key" -Query '' -Creds $script:AwsCreds
-        }
+        $url = "https://$S3Bucket.s3.amazonaws.com/$S3Key"
 
         # HEAD request for file size
         try {
-            $head  = Invoke-WebRequest -Uri $url -Method HEAD -Headers $headers `
+            $head  = Invoke-WebRequest -Uri $url -Method HEAD `
                 -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             $total = [long]$head.Headers['Content-Length']
         } catch { $total = 0 }
@@ -1795,7 +1627,6 @@ function Get-DriverPackage {
         # Stream download directly -- no AWSPowerShell needed
         $req = [System.Net.HttpWebRequest]::Create($url)
         $req.Method  = 'GET'; $req.Timeout = 600000; $req.ReadWriteTimeout = 600000
-        foreach ($h in $headers.GetEnumerator()) { $req.Headers[$h.Key] = $h.Value }
         $resp   = $req.GetResponse()
         $stream = $resp.GetResponseStream()
         $fs     = [System.IO.File]::Create($tmpDest)
@@ -1950,11 +1781,9 @@ function Request-Reboot {
 #  STATUS + ONLINE CHECK
 # -------------------------------------------------------------
 function Step-ShowStatus {
-    Write-Log "[TIMING] Detecting GPU..." -Level "INFO"
     $spinCtx = Start-Spinner -Label "Detecting GPU"
     $info    = Get-InstalledNvidiaInfo
     Stop-Spinner -ctx $spinCtx
-    Write-Log "[TIMING] GPU detect done: $($info.GpuName)" -Level "INFO"
     if (-not $info.Installed) {
         Write-Host "  No NVIDIA driver detected." -ForegroundColor Red
         Write-Log "No NVIDIA driver detected" -Level "WARN"
@@ -2040,39 +1869,11 @@ function Invoke-FullInstall {
         $rsGaming.Open(); $rsGrid.Open()
 
         $fetchSb = {
-            param($bucket, $prefix, $creds)
-            function Get-SHA256 { param([string]$s)
-                $sha=[Security.Cryptography.SHA256]::Create()
-                [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-            }
-            function Get-HmacSHA256 { param([byte[]]$key,[string]$data)
-                (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-            }
-            function Get-SigV4Headers { param($Method,$Bucket,$Path,$Query,$Creds)
-                $region='us-east-1'; $now=[DateTime]::UtcNow
-                $amzDate=$now.ToString('yyyyMMddTHHmmssZ'); $date=$now.ToString('yyyyMMdd')
-                $bodyHash='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-                $canonHeaders="host:$Bucket.s3.amazonaws.com`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-                $signedHeaders='host;x-amz-content-sha256;x-amz-date'
-                if ($Creds.Token) {
-                    $canonHeaders+="x-amz-security-token:$($Creds.Token)`n"
-                    $signedHeaders+=';x-amz-security-token'
-                }
-                $canon="$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-                $scope="$date/$region/s3/aws4_request"
-                $sts="AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canon)"
-                $sigKey=Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) 's3') 'aws4_request'
-                $sig=[BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash([Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-                $h=@{'x-amz-date'=$amzDate;'x-amz-content-sha256'=$bodyHash;'Authorization'="AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"}
-                if ($Creds.Token) { $h['x-amz-security-token']=$Creds.Token }
-                return $h
-            }
+            param($bucket, $prefix, $credKey, $credSecret, $credToken)
             try {
                 $query="list-type=2&prefix=$([Uri]::EscapeDataString($prefix))&max-keys=20"
                 $url="https://$bucket.s3.amazonaws.com/?$query"
-                $headers=@{}
-                if ($creds) { $headers=Get-SigV4Headers -Method 'GET' -Bucket $bucket -Path '/' -Query "?$query" -Creds $creds }
-                $resp=Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                $resp=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
                 [xml]$xml=$resp.Content
                 $key=$xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
                 if ($key -and ($key -match '(\d+\.\d+)')) { return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$bucket; Error=$false } }
@@ -2080,12 +1881,15 @@ function Invoke-FullInstall {
             } catch { return @{ Version='Unknown'; S3Key=''; S3Bucket=$bucket; Error=$true; ErrorMsg=$_.ToString() } }
         }
 
+        $credKey    = if ($script:AwsCreds) { $script:AwsCreds.Key    } else { '' }
+        $credSecret = if ($script:AwsCreds) { $script:AwsCreds.Secret } else { '' }
+        $credToken  = if ($script:AwsCreds) { $script:AwsCreds.Token  } else { '' }
         $pshGaming = [System.Management.Automation.PowerShell]::Create()
         $pshGaming.Runspace = $rsGaming
-        $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($script:AwsCreds) | Out-Null
+        $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
         $pshGrid   = [System.Management.Automation.PowerShell]::Create()
         $pshGrid.Runspace = $rsGrid
-        $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($script:AwsCreds) | Out-Null
+        $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
 
         $_awsCtx    = Start-Spinner -Label "Loading"
         $hGaming    = $pshGaming.BeginInvoke()
@@ -2212,50 +2016,19 @@ foreach ($dir in @($WorkDir,$DownloadDir)) {
 Show-Banner
 
 # -- Check for saved state (before loading AWS -- resume may not need S3) ----
-Write-Log "[TIMING] Script start" -Level "INFO"
 $existingState = Load-State
 $isResume = $existingState -and $existingState.Step -in @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP","UNINSTALLING")
 
 # -- Load credentials + prefetch S3 versions in parallel via runspaces --------
 if (-not $isResume) {
-    Write-Log "[TIMING] Getting AWS creds..." -Level "INFO"
     $script:AwsCreds = Get-AwsCreds
-    Write-Log "[TIMING] AWS creds done. Key=$(if($script:AwsCreds){'found'}else{'none'})" -Level "INFO"
 
     $fetchSb = {
-        param($bucket, $prefix, $creds)
-        function Get-SHA256 { param([string]$s)
-            $sha=[Security.Cryptography.SHA256]::Create()
-            [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-        }
-        function Get-HmacSHA256 { param([byte[]]$key,[string]$data)
-            (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($data))
-        }
-        function Get-SigV4Headers { param($Method,$Bucket,$Path,$Query,$Creds)
-            $region='us-east-1'; $now=[DateTime]::UtcNow
-            $amzDate=$now.ToString('yyyyMMddTHHmmssZ'); $date=$now.ToString('yyyyMMdd')
-            $bodyHash='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-            $canonHeaders="host:$Bucket.s3.amazonaws.com`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-            $signedHeaders='host;x-amz-content-sha256;x-amz-date'
-            if ($Creds -and $Creds.Token) {
-                $canonHeaders+="x-amz-security-token:$($Creds.Token)`n"
-                $signedHeaders+=';x-amz-security-token'
-            }
-            $canon="$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-            $scope="$date/$region/s3/aws4_request"
-            $sts="AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256 $canon)"
-            $sigKey=Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 ([Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) 's3') 'aws4_request'
-            $sig=[BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash([Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-            $h=@{'x-amz-date'=$amzDate;'x-amz-content-sha256'=$bodyHash;'Authorization'="AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"}
-            if ($Creds.Token) { $h['x-amz-security-token']=$Creds.Token }
-            return $h
-        }
+        param($bucket, $prefix, $credKey, $credSecret, $credToken)
         try {
             $query="list-type=2&prefix=$([Uri]::EscapeDataString($prefix))&max-keys=20"
             $url="https://$bucket.s3.amazonaws.com/?$query"
-            $headers=@{}
-            if ($creds) { $headers=Get-SigV4Headers -Method 'GET' -Bucket $bucket -Path '/' -Query "?$query" -Creds $creds }
-            $resp=Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            $resp=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             [xml]$xml=$resp.Content
             $key=$xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
             if ($key -and ($key -match '(\d+\.\d+)')) { return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$bucket; Error=$false } }
@@ -2267,28 +2040,27 @@ if (-not $isResume) {
     $rsGrid   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rsGaming.Open(); $rsGrid.Open()
 
+    $credKey    = if ($script:AwsCreds) { $script:AwsCreds.Key    } else { '' }
+    $credSecret = if ($script:AwsCreds) { $script:AwsCreds.Secret } else { '' }
+    $credToken  = if ($script:AwsCreds) { $script:AwsCreds.Token  } else { '' }
+
     $pshGaming = [System.Management.Automation.PowerShell]::Create()
     $pshGaming.Runspace = $rsGaming
-    $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($script:AwsCreds) | Out-Null
+    $pshGaming.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
     $pshGrid = [System.Management.Automation.PowerShell]::Create()
     $pshGrid.Runspace = $rsGrid
-    $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($script:AwsCreds) | Out-Null
+    $pshGrid.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($credKey).AddArgument($credSecret).AddArgument($credToken) | Out-Null
 
-    Write-Log "[TIMING] Starting S3 runspaces..." -Level "INFO"
     $_loadCtx = Start-Spinner -Label "Loading"
     $hGaming  = $pshGaming.BeginInvoke()
     $hGrid    = $pshGrid.BeginInvoke()
     while (-not $hGaming.IsCompleted -or -not $hGrid.IsCompleted) { Start-Sleep -Milliseconds 100 }
     Stop-Spinner -ctx $_loadCtx
-    Write-Log "[TIMING] S3 runspaces done" -Level "INFO"
 
     $script:S3CacheGaming = $pshGaming.EndInvoke($hGaming)[0]
     $script:S3CacheGrid   = $pshGrid.EndInvoke($hGrid)[0]
     $pshGaming.Dispose(); $rsGaming.Close()
     $pshGrid.Dispose();   $rsGrid.Close()
-    Write-Log "[TIMING] S3 Gaming=$(if($script:S3CacheGaming.Error){'ERROR'}else{$script:S3CacheGaming.Version}) Grid=$(if($script:S3CacheGrid.Error){'ERROR'}else{$script:S3CacheGrid.Version})" -Level "INFO"
-    if ($script:S3CacheGaming.Error) { Write-Log "[TIMING] S3 Gaming error detail: $($script:S3CacheGaming.ErrorMsg)" -Level "INFO" }
-    if ($script:S3CacheGrid.Error)   { Write-Log "[TIMING] S3 Grid error detail: $($script:S3CacheGrid.ErrorMsg)" -Level "INFO" }
 
     if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version='Unknown'; S3Key=''; S3Bucket='nvidia-gaming'; Error=$true } }
     if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version='Unknown'; S3Key=''; S3Bucket='ec2-windows-nvidia-drivers'; Error=$true } }
