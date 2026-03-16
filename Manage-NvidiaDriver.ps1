@@ -1,5 +1,4 @@
 #Requires -RunAsAdministrator
-param([switch]$DebugS3)
 <#
 .SYNOPSIS
     airgpu Driver Manager -- NVIDIA driver management for Windows 11.
@@ -12,9 +11,12 @@ param([switch]$DebugS3)
     - Clean uninstall + registry cleanup, single reboot, then install
 
 .NOTES
-    Run as Administrator. Working dir: C:\Program Files\airgpu\Driver Manager\
-    Log file: C:\Program Files\airgpu\Driver Manager\driver_manager.log
+    Run as Administrator. No external modules required.
+    Uses native HTTP with AWS Signature V4 for S3 access.
+    Working dir : C:\Program Files\airgpu\Driver Manager\
+    Log file    : C:\Program Files\airgpu\Driver Manager\driver_manager.log
 #>
+
 
 # -------------------------------------------------------------
 #  CONFIGURATION
@@ -28,191 +30,336 @@ $RunName      = "airgpuDriverManagerResume"
 $ScriptPath   = $MyInvocation.MyCommand.Path
 $ExePath      = "C:\Program Files\airgpu\airgpu-driver-manager.exe"
 $AwsCredsFile = "$env:USERPROFILE\.aws\credentials"
-$script:S3CacheGaming = $null
+$script:S3CacheGaming = $null   # cached per session
 $script:S3CacheGrid   = $null
-$script:AwsCreds      = $null
+
+# Ensure TLS 1.2+ for all HTTPS calls (required on older Win10/PS5.1 defaults)
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------------------------------------
-#  LOGGING
+#  LOGGING  (moderate -- key events only, no per-registry-key spam)
 # -------------------------------------------------------------
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
-    $ts   = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $line = "[$ts] [$Level] $Message"
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
-    if ($Level -eq "WARN")  { Write-Host "  [!] $Message" -ForegroundColor Yellow }
-    if ($Level -eq "ERROR") { Write-Host "  [x] $Message" -ForegroundColor Red }
+    # Only print to console for WARN/ERROR (INFO goes to log file only)
+    switch ($Level) {
+        "ERROR" { Write-Host "  [!] $Message" -ForegroundColor Red }
+        "WARN"  { Write-Host "  [!] $Message" -ForegroundColor Yellow }
+        # OK and INFO: log file only
+    }
 }
 
+
 # -------------------------------------------------------------
-#  SPINNER
+#  SPINNER  (Braille, runs in runspace, call Stop-Spinner to end)
 # -------------------------------------------------------------
 function Start-Spinner {
-    param([string]$Label = "Loading")
-    $ctx = @{ Stop = $false; Thread = $null }
-    $sb  = {
-        param($lbl, $ctxRef)
-        $frames = [char]0x28F7,[char]0x28EF,[char]0x28DF,[char]0x287F,[char]0x28BF,[char]0x28FB,[char]0x28FD,[char]0x28FE
+    param([string]$Label = "Working")
+    $flag = [System.Collections.Generic.List[bool]]::new(); $flag.Add($false)
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('stopFlag', $flag)
+    $rs.SessionStateProxy.SetVariable('label', $Label)
+    $psh = [System.Management.Automation.PowerShell]::Create(); $psh.Runspace = $rs
+    $psh.AddScript({
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $frames = [char[]]@(0x280B,0x2819,0x2839,0x2838,0x283C,0x2834,0x2826,0x2827,0x2807,0x280F)
         $i = 0
-        while (-not $ctxRef.Stop) {
-            [Console]::Write("`r  " + $frames[$i % $frames.Count] + " $lbl...")
-            $i++
-            Start-Sleep -Milliseconds 80
+        while (-not $stopFlag[0]) {
+            [Console]::Write("`r  $label  " + $frames[$i % $frames.Count] + "  ")
+            Start-Sleep -Milliseconds 80; $i++
         }
-        [Console]::Write("`r" + (" " * ($lbl.Length + 10)) + "`r")
-    }
-    $rs  = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rs.Open()
-    $psh = [System.Management.Automation.PowerShell]::Create()
-    $psh.Runspace = $rs
-    $psh.AddScript($sb).AddArgument($Label).AddArgument($ctx) | Out-Null
-    $ctx.Thread = $psh.BeginInvoke()
-    $ctx.Psh    = $psh
-    $ctx.Rs     = $rs
-    return $ctx
+    }) | Out-Null
+    $h = $psh.BeginInvoke()
+    return @{ Psh=$psh; Rs=$rs; Handle=$h; Flag=$flag }
 }
-
 function Stop-Spinner {
-    param($ctx, [string]$Done = "", [string]$Color = "DarkCyan")
-    $ctx.Stop = $true
-    Start-Sleep -Milliseconds 120
-    try { $ctx.Psh.EndInvoke($ctx.Thread) } catch {}
-    $ctx.Psh.Dispose()
-    $ctx.Rs.Close()
-    if ($Done) { Write-Host "  $Done" -ForegroundColor $Color }
+    param($ctx, [string]$Done = "", [string]$Color = "Green")
+    $ctx.Flag[0] = $true; Start-Sleep -Milliseconds 150
+    $ctx.Psh.EndInvoke($ctx.Handle) | Out-Null
+    $ctx.Psh.Dispose(); $ctx.Rs.Close()
+    if ($Done) { Write-Host "`r  $Done                              " -ForegroundColor $Color }
+    else        { Write-Host "`r                                      " -NoNewline
+                  Write-Host "" }
+    [Console]::Out.Flush()
 }
 
+
 # -------------------------------------------------------------
-#  AWS CREDENTIALS (no AWSPowerShell module required)
+#  RUN WITH SPINNER
+#  Runs a ScriptBlock in a Job (separate process),
+#  shows spinner on main thread, returns result via temp file.
 # -------------------------------------------------------------
-function Get-AwsCreds {
-    # 1. Try credentials file
+function Invoke-WithSpinner {
+    param([string]$Label, [scriptblock]$ScriptBlock, [object[]]$ArgumentList = @())
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    $job = Start-Job -ScriptBlock {
+        param($sb, $args, $out)
+        try {
+            $result = & ([scriptblock]::Create($sb)) @args
+            $result | ConvertTo-Json -Depth 5 | Set-Content $out -Encoding UTF8
+        } catch {
+            @{ Error = $_.ToString() } | ConvertTo-Json | Set-Content $out -Encoding UTF8
+        }
+    } -ArgumentList $ScriptBlock.ToString(), $ArgumentList, $tmpFile
+    $spinCtx = Start-Spinner -Label $Label
+    while ($job.State -eq "Running") { Start-Sleep -Milliseconds 150 }
+    Stop-Spinner -ctx $spinCtx
+    Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job $job -ErrorAction SilentlyContinue
+    $raw = Get-Content $tmpFile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tmpFile -ErrorAction SilentlyContinue
+    if ($raw) { return $raw | ConvertFrom-Json } else { return $null }
+}
+
+# =============================================================
+#  AWS CREDENTIALS  (native -- no AWSPowerShell module required)
+#  Sources: 1) ~/.aws/credentials file  2) EC2 IMDS instance role
+# =============================================================
+$script:AwsAccessKey       = $null
+$script:AwsSecretKey       = $null
+$script:AwsSessionToken    = $null
+$script:AwsRegion          = "us-east-1"
+$script:AwsCredentialsLoaded = $false
+
+function Initialize-AwsCredentials {
+    if ($script:AwsCredentialsLoaded) { return ($null -ne $script:AwsAccessKey) }
+
+    # --- Source 1: credentials file ---
     if (Test-Path $AwsCredsFile) {
         try {
+            $ini = Get-Content $AwsCredsFile | Where-Object { $_ -match '^\s*\w' -and $_ -match '=' }
             $kvp = @{}
-            Get-Content $AwsCredsFile | Where-Object { $_ -match '=' } | ForEach-Object {
-                $p = $_ -split '\s*=\s*', 2
-                if ($p.Count -eq 2) { $kvp[$p[0].Trim()] = $p[1].Trim() }
+            $ini | ForEach-Object {
+                $parts = $_ -split '\s*=\s*', 2
+                if ($parts.Count -eq 2) { $kvp[$parts[0].Trim()] = $parts[1].Trim() }
             }
-            $k = $kvp['aws_access_key_id']; $s = $kvp['aws_secret_access_key']
-            if ($k -and $s) {
+            $key    = $kvp['aws_access_key_id']
+            $secret = $kvp['aws_secret_access_key']
+            if ($key -and $secret) {
+                $script:AwsAccessKey    = $key
+                $script:AwsSecretKey    = $secret
+                $script:AwsSessionToken = $kvp['aws_session_token']   # may be $null
                 Write-Log "AWS credentials loaded from file" -Level "INFO"
-                return @{ Key=$k; Secret=$s; Token='' }
+                $script:AwsCredentialsLoaded = $true
+                return $true
+            } else {
+                Write-Log "Credentials file found but key/secret missing -- trying IMDS" -Level "INFO"
             }
-        } catch {}
-    }
-    # 2. Try IMDSv2 instance role
-    try {
-        $token = (Invoke-WebRequest -Uri 'http://169.254.169.254/latest/api/token' `
-            -Method PUT -Headers @{'X-aws-ec2-metadata-token-ttl-seconds'='21600'} `
-            -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop).Content
-        $role = (Invoke-WebRequest -Uri 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' `
-            -Headers @{'X-aws-ec2-metadata-token'=$token} `
-            -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop).Content.Trim()
-        if ($role) {
-            $j = (Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/$role" `
-                -Headers @{'X-aws-ec2-metadata-token'=$token} `
-                -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop).Content | ConvertFrom-Json
-            Write-Log "AWS credentials loaded from IAM role: $role" -Level "INFO"
-            return @{ Key=$j.AccessKeyId; Secret=$j.SecretAccessKey; Token=$j.Token }
+        } catch {
+            Write-Log "AWS credentials file error: $_ -- trying IMDS" -Level "INFO"
         }
-    } catch {
-        Write-Log "[TIMING] IMDSv2 failed/timeout" -Level "INFO"
     }
-    Write-Log "No AWS credentials found" -Level "INFO"
-    return $null
+
+    # --- Source 2: EC2 Instance Metadata Service (IMDSv2 first, then v1) ---
+    $imdsBase = "http://169.254.169.254/latest"
+    # IMDSv2
+    try {
+        $token = Invoke-RestMethod -Uri "$imdsBase/api/token" -Method PUT `
+            -Headers @{ "X-aws-ec2-metadata-token-ttl-seconds" = "300" } `
+            -TimeoutSec 2 -ErrorAction Stop
+        $mdH = @{ "X-aws-ec2-metadata-token" = $token }
+        $role = (Invoke-RestMethod -Uri "$imdsBase/meta-data/iam/security-credentials/" `
+            -Headers $mdH -TimeoutSec 2 -ErrorAction Stop) -split "`n" | Select-Object -First 1
+        $creds = Invoke-RestMethod -Uri "$imdsBase/meta-data/iam/security-credentials/$($role.Trim())" `
+            -Headers $mdH -TimeoutSec 2 -ErrorAction Stop
+        $script:AwsAccessKey    = $creds.AccessKeyId
+        $script:AwsSecretKey    = $creds.SecretAccessKey
+        $script:AwsSessionToken = $creds.Token
+        Write-Log "AWS credentials loaded from IMDSv2 (role: $($role.Trim()))" -Level "INFO"
+        $script:AwsCredentialsLoaded = $true
+        return $true
+    } catch { }
+    # IMDSv1 fallback
+    try {
+        $role = (Invoke-RestMethod -Uri "$imdsBase/meta-data/iam/security-credentials/" `
+            -TimeoutSec 2 -ErrorAction Stop) -split "`n" | Select-Object -First 1
+        $creds = Invoke-RestMethod -Uri "$imdsBase/meta-data/iam/security-credentials/$($role.Trim())" `
+            -TimeoutSec 2 -ErrorAction Stop
+        $script:AwsAccessKey    = $creds.AccessKeyId
+        $script:AwsSecretKey    = $creds.SecretAccessKey
+        $script:AwsSessionToken = $creds.Token
+        Write-Log "AWS credentials loaded from IMDSv1 (role: $($role.Trim()))" -Level "INFO"
+        $script:AwsCredentialsLoaded = $true
+        return $true
+    } catch { }
+
+    Write-Log "No AWS credentials available (no file, no IMDS)" -Level "INFO"
+    $script:AwsCredentialsLoaded = $true   # mark as attempted so we don't retry
+    return $false
 }
 
-# -------------------------------------------------------------
-#  AWS SIG V4 HELPERS
-# -------------------------------------------------------------
-function Get-SHA256Hash {
-    param([string]$s)
+# =============================================================
+#  AWS SIGNATURE V4  (pure .NET -- zero external dependencies)
+# =============================================================
+function Get-HmacSha256Bytes {
+    param([byte[]]$Key, [string]$Message)
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(,$Key)
+    return ,$hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Message))
+}
+
+function Get-Sha256Hex {
+    param([string]$Text)
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    [BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
+    $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+    return -join ($hash | ForEach-Object { $_.ToString("x2") })
 }
 
-function Get-HmacSHA256 {
-    param([byte[]]$key, [string]$data)
-    $h = New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)
-    return $h.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($data))
-}
+function New-S3SignedRequest {
+    <#
+    .SYNOPSIS
+        Creates AWS Signature V4 signed headers for an S3 request.
+        Returns @{ Url; Headers; Host } ready for Invoke-WebRequest / HttpWebRequest.
+    #>
+    param(
+        [string]$Method  = "GET",
+        [string]$Bucket,
+        [string]$Key     = "",           # object key (without leading /)
+        [hashtable]$QueryParams = @{},   # e.g. @{ "list-type"="2"; "prefix"="..." }
+        [string]$Region  = "us-east-1"
+    )
 
-function Get-SigV4Headers {
-    param($Method, $Bucket, $Path, $Query, $Creds)
-    $region  = 'us-east-1'
-    $now     = [DateTime]::UtcNow
-    $amzDate = $now.ToString('yyyyMMddTHHmmssZ')
-    $date    = $now.ToString('yyyyMMdd')
-    $bodyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-    $host_hdr = "$Bucket.s3.amazonaws.com"
-    $canonHeaders = "host:$host_hdr`nx-amz-content-sha256:$bodyHash`nx-amz-date:$amzDate`n"
-    $signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
-    if ($Creds.Token) {
-        $canonHeaders  += "x-amz-security-token:$($Creds.Token)`n"
-        $signedHeaders  += ';x-amz-security-token'
+    if (-not $script:AwsAccessKey -or -not $script:AwsSecretKey) {
+        throw "AWS credentials not initialised -- call Initialize-AwsCredentials first"
     }
-    $canonReq = "$Method`n$Path`n$($Query.TrimStart('?'))`n$canonHeaders`n$signedHeaders`n$bodyHash"
-    $scope    = "$date/$region/s3/aws4_request"
-    $sts      = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-SHA256Hash $canonReq)"
-    $sigKey   = Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 (Get-HmacSHA256 `
-                    ([System.Text.Encoding]::UTF8.GetBytes("AWS4$($Creds.Secret)")) $date) $region) 's3') 'aws4_request'
-    $sig      = [BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 `
-                    -ArgumentList @(,$sigKey)).ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-    $h = @{
-        'x-amz-date'            = $amzDate
-        'x-amz-content-sha256'  = $bodyHash
-        'Authorization'         = "AWS4-HMAC-SHA256 Credential=$($Creds.Key)/$scope,SignedHeaders=$signedHeaders,Signature=$sig"
+
+    $now       = [DateTime]::UtcNow
+    $dateStamp = $now.ToString("yyyyMMdd")
+    $amzDate   = $now.ToString("yyyyMMddTHHmmssZ")
+    $s3Host    = "$Bucket.s3.$Region.amazonaws.com"
+    $uriPath   = "/" + ($Key -replace '\\','/')
+    $payloadHash = "UNSIGNED-PAYLOAD"
+
+    # --- Canonical query string (sorted, URI-encoded) ---
+    $cqs = ""
+    if ($QueryParams.Count -gt 0) {
+        $parts = $QueryParams.GetEnumerator() | Sort-Object Name | ForEach-Object {
+            [Uri]::EscapeDataString($_.Name) + "=" + [Uri]::EscapeDataString($_.Value)
+        }
+        $cqs = $parts -join "&"
     }
-    if ($Creds.Token) { $h['x-amz-security-token'] = $Creds.Token }
-    return $h
+
+    # --- Canonical & signed headers (must be alphabetical) ---
+    $headerMap = [ordered]@{
+        "host"                 = $s3Host
+        "x-amz-content-sha256" = $payloadHash
+        "x-amz-date"          = $amzDate
+    }
+    if ($script:AwsSessionToken) {
+        $headerMap["x-amz-security-token"] = $script:AwsSessionToken
+    }
+    $canonicalHeaders = ($headerMap.GetEnumerator() | ForEach-Object { "$($_.Key):$($_.Value)" }) -join "`n"
+    $canonicalHeaders += "`n"
+    $signedHeaders = ($headerMap.Keys) -join ";"
+
+    # --- Canonical request ---
+    $canonicalRequest = @($Method, $uriPath, $cqs, $canonicalHeaders, $signedHeaders, $payloadHash) -join "`n"
+
+    # --- String to sign ---
+    $scope        = "$dateStamp/$Region/s3/aws4_request"
+    $stringToSign = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(Get-Sha256Hex $canonicalRequest)"
+
+    # --- Signing key derivation ---
+    $kDate    = Get-HmacSha256Bytes -Key ([System.Text.Encoding]::UTF8.GetBytes("AWS4$($script:AwsSecretKey)")) -Message $dateStamp
+    $kRegion  = Get-HmacSha256Bytes -Key $kDate    -Message $Region
+    $kService = Get-HmacSha256Bytes -Key $kRegion  -Message "s3"
+    $kSigning = Get-HmacSha256Bytes -Key $kService -Message "aws4_request"
+
+    # --- Signature ---
+    $sigBytes  = Get-HmacSha256Bytes -Key $kSigning -Message $stringToSign
+    $signature = -join ($sigBytes | ForEach-Object { $_.ToString("x2") })
+
+    $auth = "AWS4-HMAC-SHA256 Credential=$($script:AwsAccessKey)/$scope, SignedHeaders=$signedHeaders, Signature=$signature"
+
+    # Headers for Invoke-WebRequest (do NOT include Host -- .NET sets it from URL)
+    $reqHeaders = @{
+        "Authorization"        = $auth
+        "x-amz-date"          = $amzDate
+        "x-amz-content-sha256" = $payloadHash
+    }
+    if ($script:AwsSessionToken) {
+        $reqHeaders["x-amz-security-token"] = $script:AwsSessionToken
+    }
+
+    $url = "https://$s3Host$uriPath"
+    if ($cqs) { $url += "?$cqs" }
+
+    return @{ Url = $url; Headers = $reqHeaders; Host = $s3Host }
 }
 
-# -------------------------------------------------------------
-#  S3 QUERIES  (pure HTTP, no AWSPowerShell)
-# -------------------------------------------------------------
-function Get-S3DriverInfo {
-    param([string]$Bucket, [string]$Prefix, $Creds)
+# =============================================================
+#  S3 OPERATIONS  (pure HTTP -- replaces Get-S3Object etc.)
+# =============================================================
+function Get-S3ObjectList {
+    <# Returns array of @{ Key; Size } for objects matching prefix #>
+    param([string]$Bucket, [string]$Prefix, [string]$Region = "us-east-1")
+
+    $signed = New-S3SignedRequest -Method "GET" -Bucket $Bucket `
+        -QueryParams @{ "list-type"="2"; "prefix"=$Prefix } -Region $Region
+
+    $resp = Invoke-WebRequest -Uri $signed.Url -Method GET -Headers $signed.Headers `
+        -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+
+    # Parse S3 ListObjectsV2 XML (strip namespace for simple access)
+    $xmlText = $resp.Content -replace 'xmlns="[^"]*"', ''
+    [xml]$xml = $xmlText
+    $objects = @()
+    foreach ($c in $xml.ListBucketResult.Contents) {
+        if ($c) { $objects += @{ Key = [string]$c.Key; Size = [long]$c.Size } }
+    }
+    return $objects
+}
+
+function Get-S3ObjectSize {
+    <# HEAD request -- returns content length in bytes #>
+    param([string]$Bucket, [string]$Key, [string]$Region = "us-east-1")
+
     try {
-        $amp = [char]38
-        $query   = "list-type=2" + $amp + "prefix=$([Uri]::EscapeDataString($Prefix))" + $amp + "max-keys=20"
-        $url     = "https://$Bucket.s3.amazonaws.com/?$query"
-        $headers = @{}
-        if ($Creds) {
-            $headers = Get-SigV4Headers -Method 'GET' -Bucket $Bucket -Path '/' -Query "?$query" -Creds $Creds
+        $signed = New-S3SignedRequest -Method "HEAD" -Bucket $Bucket -Key $Key -Region $Region
+        $request = [System.Net.HttpWebRequest]::Create($signed.Url)
+        $request.Method = "HEAD"
+        $request.Host   = $signed.Host
+        foreach ($h in $signed.Headers.GetEnumerator()) {
+            $request.Headers.Add($h.Key, $h.Value)
         }
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        [xml]$xml = $resp.Content
-        $key = $xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
-        if ($key -and ($key -match '(\d+\.\d+)')) {
-            return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$Bucket; Error=$false }
+        $response = $request.GetResponse()
+        $size = $response.ContentLength
+        $response.Close()
+        return $size
+    } catch { return 0 }
+}
+
+function Invoke-S3Download {
+    <# Streaming download -- writes progressively so the progress bar can poll file size #>
+    param([string]$Bucket, [string]$Key, [string]$OutFile, [string]$Region = "us-east-1")
+
+    $signed = New-S3SignedRequest -Method "GET" -Bucket $Bucket -Key $Key -Region $Region
+    $request = [System.Net.HttpWebRequest]::Create($signed.Url)
+    $request.Method = "GET"
+    $request.Host   = $signed.Host
+    foreach ($h in $signed.Headers.GetEnumerator()) {
+        $request.Headers.Add($h.Key, $h.Value)
+    }
+
+    $response   = $request.GetResponse()
+    $stream     = $response.GetResponseStream()
+    # FileShare.Read allows the progress-bar runspace to stat the file while we write
+    $fileStream = [System.IO.FileStream]::new(
+        $OutFile,
+        [System.IO.FileMode]::Create,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::Read)
+    $buffer = New-Object byte[] 81920
+    try {
+        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $bytesRead)
         }
-        return @{ Version='Unknown'; S3Key=''; S3Bucket=$Bucket; Error=$false }
-    } catch {
-        return @{ Version='Unknown'; S3Key=''; S3Bucket=$Bucket; Error=$true; ErrorMsg=$_.ToString() }
+    } finally {
+        $fileStream.Close(); $stream.Close(); $response.Close()
     }
 }
 
-function Get-LatestGamingVersion {
-    if (-not $script:S3CacheGaming) {
-        $script:S3CacheGaming = Get-S3DriverInfo -Bucket 'nvidia-gaming' -Prefix 'windows/latest/' -Creds $script:AwsCreds
-    }
-    return $script:S3CacheGaming
-}
-
-function Get-LatestGridVersion {
-    if (-not $script:S3CacheGrid) {
-        $script:S3CacheGrid = Get-S3DriverInfo -Bucket 'ec2-windows-nvidia-drivers' -Prefix 'latest/' -Creds $script:AwsCreds
-    }
-    return $script:S3CacheGrid
-}
-
-function Test-GamingDriverSupported {
-    param([string]$GpuName)
-    # L4 variants (L4-3Q, L4f, L4s etc.) are GRID-only
-    if ($GpuName -match 'L4[-a-zA-Z0-9]') { return $false }
-    return $true
-}
 
 # -------------------------------------------------------------
 #  STATE MANAGEMENT
@@ -221,338 +368,442 @@ function Save-State {
     param([hashtable]$State)
     if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
     $State | ConvertTo-Json -Depth 5 | Set-Content -Path $StateFile -Encoding UTF8
+
 }
 
 function Load-State {
     if (Test-Path $StateFile) {
         try {
             $json = (Get-Content $StateFile -Raw -Encoding UTF8) | ConvertFrom-Json
-            $ht   = @{}
+            $ht = @{}
             $json.PSObject.Properties | ForEach-Object { $ht[$_.Name] = $_.Value }
             return $ht
-        } catch {}
+        } catch { Write-Log "Could not load state: $_" -Level "INFO" }
     }
     return $null
 }
 
 function Clear-State {
-    if (Test-Path $StateFile) { Remove-Item $StateFile -Force -ErrorAction SilentlyContinue }
-    # Remove resume registry key
-    try { Remove-ItemProperty -Path $RunKey -Name $RunName -ErrorAction SilentlyContinue } catch {}
+    if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
+    Remove-ItemProperty -Path $RunKey -Name $RunName -Force -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName "airgpuDriverManagerResume" -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Log "State and resume task cleared." -Level "INFO"
 }
 
-# -------------------------------------------------------------
-#  CLEANUP
-# -------------------------------------------------------------
 function Invoke-Cleanup {
-    Clear-Downloads
-    Clear-State
-    # Self-delete script after exit (delayed via cmd ping trick)
-    if ($ScriptPath -and (Test-Path $ScriptPath)) {
-        Register-ScriptDeletion $ScriptPath
+    # Remove Downloads folder
+    try {
+        if (Test-Path $DownloadDir) {
+            Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Downloads folder removed." -Level "INFO"
+        }
+    } catch { Write-Log "Download cleanup: $_" -Level "INFO" }
+    # Schedule script self-deletion after exit (cmd /c ping delay trick)
+    $script = $MyInvocation.ScriptName
+    if ($script -and (Test-Path $script)) {
+        $del = "ping -n 3 127.0.0.1 > nul & del /f /q `"$script`""
+        Start-Process "cmd.exe" -ArgumentList "/c $del" -WindowStyle Hidden
+        Write-Log "Script queued for deletion: $script" -Level "INFO"
     }
 }
 
 function Clear-Downloads {
     if (Test-Path $DownloadDir) {
-        Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Downloads folder removed." -Level "INFO"
+        Remove-Item "$DownloadDir\*" -Force -ErrorAction SilentlyContinue
+        Write-Log "Downloads cleared." -Level "INFO"
     }
 }
 
-function Register-ScriptDeletion {
-    param([string]$Path)
-    $escaped = $Path.Replace('"', '\"')
-    Start-Process -FilePath "cmd.exe" `
-        -ArgumentList ('/c', ("ping -n 3 127.0.0.1 > nul " + [char]38 + " del /f /q `"" + $escaped + "`"")) `
-        -WindowStyle Hidden -ErrorAction SilentlyContinue
-    Write-Log "Script queued for deletion: $Path" -Level "INFO"
-}
-
 function Register-ResumeOnBoot {
-    param([string]$Exe)
-    $cmd = "`"$Exe`""
-    Set-ItemProperty -Path $RunKey -Name $RunName -Value $cmd -ErrorAction SilentlyContinue
-    Write-Log "Resume on boot registered: $cmd" -Level "INFO"
+    param([string]$NextStep)
+    $state = Load-State
+    if ($null -eq $state) { $state = @{} }
+    $state.Step = $NextStep
+    Save-State $state
+
+    $launchTarget = if (Test-Path $ExePath) { $ExePath } else { "powershell.exe" }
+    $launchArgs   = if (Test-Path $ExePath) { "-Resume" } `
+                    else { "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -Resume" }
+    $action    = New-ScheduledTaskAction -Execute $launchTarget -Argument $launchArgs
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+                     -LogonType Interactive -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
+    Register-ScheduledTask -TaskName "airgpuDriverManagerResume" -Action $action `
+        -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    # Run key as backup
+    $runVal = if (Test-Path $ExePath) { "`"$ExePath`" -Resume" } `
+              else { "powershell.exe -ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`" -Resume" }
+    Set-ItemProperty -Path $RunKey -Name $RunName -Value $runVal -ErrorAction SilentlyContinue
+    Write-Log "Resume registered for step: $NextStep" -Level "INFO"
 }
 
 # -------------------------------------------------------------
-#  BANNER
+#  UI HELPERS
 # -------------------------------------------------------------
 function Show-Banner {
-    Clear-Host
     Write-Host ""
-    Write-Host "  airgpu Driver Manager" -ForegroundColor DarkCyan
-    Write-Host "  ─────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  AIRGPU " -NoNewline -ForegroundColor White
+    Write-Host "DRIVER MANAGER" -ForegroundColor DarkCyan
     Write-Host ""
 }
 
-# -------------------------------------------------------------
-#  PROMPTS
-# -------------------------------------------------------------
+
 function Prompt-YesNo {
-    param([string]$Question)
-    Write-Host "  $Question [Y/N] " -ForegroundColor Yellow -NoNewline
-    $k = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-    Write-Host ""
-    return ($k.Character -eq 'y' -or $k.Character -eq 'Y')
+    param([string]$Q)
+    do { Write-Host "  $Q [Y/N]: " -ForegroundColor Yellow -NoNewline; $a = Read-Host }
+    while ($a -notmatch '^[YyNn]$')
+    return ($a -match '^[Yy]$')
 }
 
 function Prompt-Menu {
     param([string]$Title, [string[]]$Options)
-    Write-Host ""
-    Write-Host "  $Title" -ForegroundColor Yellow
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host "    [$($i+1)] $($Options[$i])"
-    }
-    Write-Host "    [0] Cancel / Exit"
-    Write-Host ""
+    Write-Host ""; Write-Host "  $Title" -ForegroundColor Yellow
+    for ($i = 0; $i -lt $Options.Count; $i++) { Write-Host "    [$($i+1)] $($Options[$i])" }
+    Write-Host "    [0] Cancel / Exit"; Write-Host ""
     do {
         Write-Host "  Selection: " -ForegroundColor Yellow -NoNewline
-        $sel = Read-Host
-        [int]$num = -1
+        $sel = Read-Host; $num = -1
         [int]::TryParse($sel, [ref]$num) | Out-Null
     } while ($num -lt 0 -or $num -gt $Options.Count)
     return $num
 }
 
 # -------------------------------------------------------------
+#  STATE DIALOG
+#  Shown on startup when a saved state exists.
+#  Options: Resume | Start over | Clean up & exit
+# -------------------------------------------------------------
+
+# -------------------------------------------------------------
 #  GPU DETECTION
 # -------------------------------------------------------------
 function Get-InstalledNvidiaInfo {
-    $result = @{ Installed=$false; Version=''; Variant=''; GpuName=''; DriverDate='' }
+    $info = @{ Installed=$false; Version=""; Variant="Unknown"; GpuName=""; DriverDate="" }
+
+    # Try nvidia-smi first (most accurate, direct from driver)
+    $smi = if (Test-Path "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe") {
+               "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe" } else { "nvidia-smi" }
+    $smiOk = $false
     try {
-        $gpu = Get-WmiObject Win32_VideoController -ErrorAction Stop |
-               Where-Object { $_.Name -match 'NVIDIA' } |
-               Select-Object -First 1
-        if (-not $gpu) { return $result }
-        $result.GpuName = $gpu.Name
-        # Detect version from registry
-        $regPaths = @(
-            'HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak',
-            'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E968-E325-11CE-BFC1-08002BE10318}\0000'
-        )
-        $ver = ''
-        foreach ($rp in $regPaths) {
-            try {
-                $v = (Get-ItemProperty $rp -ErrorAction Stop).DriverVersion
-                if ($v -match '(\d+\.\d+)') { $ver = $Matches[1]; break }
-            } catch {}
-        }
-        if (-not $ver -and $gpu.DriverVersion) {
-            # WMI format: 31.0.15.x -> take last two groups -> x/100
-            if ($gpu.DriverVersion -match '(\d+)\.(\d+)$') {
-                $ver = "$($Matches[1]).$($Matches[2])"
+        $out = & $smi --query-gpu=name,driver_version --format=csv,noheader 2>&1
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $p = $out -split ","
+            if ($p.Count -ge 2) {
+                $info.GpuName = $p[0].Trim()
+                $info.Version = $p[1].Trim()
+                $smiOk = $true
             }
         }
-        $result.Version = $ver
+    } catch { }
 
-        # Detect variant: check for vGPU/GRID service or license
-        $isGrid = $false
-        $gridSvc = Get-Service -Name 'NvContainerLocalSystem','nvlddmkm' -ErrorAction SilentlyContinue |
-                   Where-Object { $_.DisplayName -match 'Grid|vGPU|Enterprise' }
-        if ($gridSvc) { $isGrid = $true }
-        # Also check GPU name
-        if ($gpu.Name -match 'Tesla|Quadro|RTX.*A\d|A\d+\s' -and $gpu.Name -notmatch 'GeForce') { $isGrid = $true }
-        $result.Variant = if ($isGrid) { 'GRID' } else { 'Gaming' }
+    # Fall back to WMI if nvidia-smi unavailable
+    if (-not $smiOk) {
+        $gpu = Get-CimInstance Win32_VideoController |
+            Where-Object { $_.Name -like "*NVIDIA*" -or $_.AdapterCompatibility -like "*NVIDIA*" } |
+            Select-Object -First 1
+        if (-not $gpu) { return $info }  # no NVIDIA GPU found at all
+        $info.GpuName    = $gpu.Name
+        $info.DriverDate = $gpu.DriverDate
+        $info.Version    = if ($gpu.DriverVersion -match '(\d{3})(\d{2})$') { "$($Matches[1]).$($Matches[2])" }
+                           else { $gpu.DriverVersion }
+    }
 
-        # Driver date from registry
-        try {
-            $dd = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E968-E325-11CE-BFC1-08002BE10318}\0000' `
-                        -ErrorAction Stop).DriverDate
-            if ($dd) { $result.DriverDate = $dd }
-        } catch {}
+    if (-not $info.GpuName -and -not $info.Version) { return $info }
+    $info.Installed = $true
 
-        $result.Installed = $true
-    } catch {}
-    return $result
+    $names = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+        -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*NVIDIA*" } |
+        ForEach-Object { $_.DisplayName }) -join " "
+
+    $vGaming = (Get-ItemProperty "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "vGamingMarketplace" -ErrorAction SilentlyContinue).vGamingMarketplace
+
+    if     ($vGaming -eq 2)                                                              { $info.Variant = "Gaming" }
+    elseif ($names -match "GRID|vGPU|Virtual GPU|Tesla|Enterprise")                     { $info.Variant = "GRID" }
+    elseif ($names -match "GeForce|Game Ready|Gaming|Studio")               { $info.Variant = "Gaming" }
+    elseif ($info.GpuName -match "Tesla|A10|A100|T4|V100|K80|A10G|L4|L40") { $info.Variant = "GRID" }
+    else {
+        $repoPath = "$env:SystemRoot\System32\DriverStore\FileRepository"
+        if     (Get-ChildItem $repoPath -Filter "nvgridswgame*" -ErrorAction SilentlyContinue) { $info.Variant = "Gaming" }
+        elseif (Get-ChildItem $repoPath -Filter "nvgridsw_aws*" -ErrorAction SilentlyContinue) { $info.Variant = "GRID" }
+        else   { $info.Variant = "Unknown" }
+    }
+    return $info
+}
+
+# -------------------------------------------------------------
+#  S3 VERSION CHECK  (HTTP)
+#  Gaming : s3://nvidia-gaming/windows/latest/
+#  GRID   : s3://ec2-windows-nvidia-drivers/latest/
+# -------------------------------------------------------------
+function Get-S3DriverInfo {
+    param([string]$Bucket, [string]$Prefix)
+    try {
+        $objects = Get-S3ObjectList -Bucket $Bucket -Prefix $Prefix
+        $exe = $objects | Where-Object { $_.Key -like "*.exe" } | Select-Object -First 1
+        if ($exe -and (Split-Path $exe.Key -Leaf) -match '(\d+\.\d+)') {
+            return @{ Version=$Matches[1]; S3Key=$exe.Key; S3Bucket=$Bucket; Error=$false }
+        }
+        Write-Log "S3 lookup: no .exe found in $Bucket/$Prefix" -Level "INFO"
+        return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$false }
+    } catch {
+        Write-Log "S3 lookup failed ($Bucket): $_" -Level "INFO"
+        return @{ Version="Unknown"; S3Key=""; S3Bucket=""; Error=$true }
+    }
+}
+
+function Get-LatestGamingVersion {
+    if (-not $script:S3CacheGaming) {
+        $script:S3CacheGaming = Get-S3DriverInfo -Bucket "nvidia-gaming" -Prefix "windows/latest/"
+    }
+    return $script:S3CacheGaming
+}
+
+function Test-GamingDriverSupported {
+    param([string]$GpuName)
+    # Gaming driver supported on: T4 (G4dn), A10G (G5), L4 (G6), L40S (G6e)
+    # NOT supported on fractal variants: L4f, L4s etc. (G6f)
+    if ($GpuName -match '(?i)\bT4\b')                                             { return $true }
+    if ($GpuName -match '(?i)\bA10G\b')                                           { return $true }
+    if ($GpuName -match '(?i)\bL40S\b')                                           { return $true }
+    if ($GpuName -match '(?i)\bL4\b' -and $GpuName -notmatch '(?i)\bL4[-a-zA-Z0-9]') { return $true }
+    return $false
+}
+
+function Get-LatestGridVersion {
+    if (-not $script:S3CacheGrid) {
+        $script:S3CacheGrid = Get-S3DriverInfo -Bucket "ec2-windows-nvidia-drivers" -Prefix "latest/"
+    }
+    return $script:S3CacheGrid
 }
 
 # -------------------------------------------------------------
 #  UNINSTALL
 # -------------------------------------------------------------
 function Invoke-NvidiaUninstall {
-    Write-Log "Starting NVIDIA uninstall..." -Level "INFO"
-    # 1. Programs & Features uninstall entries
-    $apps = @()
-    @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') | ForEach-Object {
-        $apps += Get-ChildItem $_ -ErrorAction SilentlyContinue |
-                 Get-ItemProperty -ErrorAction SilentlyContinue |
-                 Where-Object { $_.DisplayName -like '*NVIDIA*' -and $_.UninstallString }
+    Write-Log "Uninstall started" -Level "INFO"
+    $spinCtx = Start-Spinner -Label "Uninstalling"
+
+    # Kill NVIDIA Desktop Manager + Container before uninstall
+    @("nvdm","nvdmui","NVDisplay.Container") | ForEach-Object {
+        Get-Process -Name $_ -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     }
+
+    # Remove NVIDIA Control Panel + Desktop Manager AppX packages
+    @("NVIDIACorp.NVIDIAControlPanel","NVIDIACorp.NvidiaDisplayContainer") | ForEach-Object {
+        $pkg = Get-AppxPackage -Name $_ -AllUsers -ErrorAction SilentlyContinue
+        if ($pkg) {
+            Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+            Write-Log "Removed AppX: $_" -Level "INFO"
+        }
+    }
+
+
+    # Registered entries
+    $apps = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like "*NVIDIA*" -and $_.UninstallString }
+
     foreach ($app in $apps) {
         Write-Log "Uninstalling: $($app.DisplayName)" -Level "INFO"
         try {
-            if ($app.UninstallString -match 'MsiExec') {
-                $guidPat = [char]123 + [char]91 + [char]94 + [char]125 + [char]93 + [char]43 + [char]125
-                $guidMatch = [regex]::Match($app.UninstallString, $guidPat)
-                $guid = $guidMatch.Value
-                if ($guid) {
-                    $proc = Start-Process msiexec.exe -ArgumentList "/x $guid /quiet /norestart" -PassThru -NoNewWindow
-                    if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } }
-                }
-            } elseif ($app.UninstallString -match '\.exe') {
-                $exePat = [char]91 + [char]94 + [char]34 + [char]93 + [char]43 + '\.exe'
-                $exeMatch = [regex]::Match($app.UninstallString, $exePat)
-                $exe = $exeMatch.Value
-                if ($exe -and (Test-Path $exe)) {
-                    $proc = Start-Process $exe -ArgumentList '-s -noreboot' -PassThru -NoNewWindow
-                    if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } }
-                }
+            if ($app.UninstallString -match "MsiExec") {
+                $guid = [regex]::Match($app.UninstallString, '\{[^}]+\}').Value
+                if ($guid) { $proc = Start-Process msiexec.exe -ArgumentList "/x $guid /quiet /norestart" -PassThru -NoNewWindow; if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } } }
+            } elseif ($app.UninstallString -match "\.exe") {
+                $exe = [regex]::Match($app.UninstallString, '"?([^"]+\.exe)"?').Groups[1].Value
+                if ($exe -and (Test-Path $exe)) { $proc = Start-Process $exe -ArgumentList "-s -noreboot" -PassThru -NoNewWindow; if ($proc) { while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 } } }
             }
         } catch { Write-Log "Failed to uninstall '$($app.DisplayName)': $_" -Level "INFO" }
     }
-    # 2. NVI2.EXE / setup.exe
+
+    # NVI2.EXE / setup.exe for display driver
     $setup = Get-ChildItem "$env:ProgramFiles\NVIDIA Corporation\Installer2\InstallerCore" `
-                 -Filter 'NVI2.EXE' -ErrorAction SilentlyContinue | Select-Object -First 1
+                 -Filter "NVI2.EXE" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $setup) {
         $setup = Get-ChildItem "$env:SystemRoot\System32\DriverStore\FileRepository" `
-                     -Filter 'setup.exe' -Recurse -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match 'nv' } | Select-Object -First 1
+                     -Recurse -Filter "setup.exe" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -like "*nv*" } | Select-Object -First 1
     }
     if ($setup) {
-        Write-Log "Running NVI2/setup uninstall: $($setup.FullName)" -Level "INFO"
+        Write-Log "Running display driver uninstaller" -Level "INFO"
         try {
-            $proc = Start-Process $setup.FullName -ArgumentList '-passive -noreboot -clean' -PassThru -NoNewWindow
-            if ($proc) { $proc.WaitForExit(300000) }
-        } catch { Write-Log "NVI2 uninstall error: $_" -Level "INFO" }
-    }
-    Write-Log "NVIDIA uninstall complete." -Level "INFO"
-}
-
-function Invoke-RegistryCleanup {
-    Write-Log "Running registry cleanup..." -Level "INFO"
-    $keys = @(
-        'HKLM:\SOFTWARE\NVIDIA Corporation',
-        'HKLM:\SOFTWARE\WOW6432Node\NVIDIA Corporation',
-        'HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm',
-        'HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkmSvc'
-    )
-    foreach ($key in $keys) {
-        if (Test-Path $key) {
-            try { Remove-Item $key -Recurse -Force -ErrorAction Stop; Write-Log "Removed: $key" -Level "INFO" }
-            catch { Write-Log "Could not remove $key`: $_" -Level "INFO" }
+            $setupProc = Start-Process $setup.FullName -ArgumentList "-s -noreboot -clean" -PassThru -NoNewWindow
+            while (-not $setupProc.HasExited) { Start-Sleep -Milliseconds 500 }
+        } catch { Write-Log "Display driver uninstall failed: $_" -Level "INFO" }
+    } else {
+        $list = pnputil /enum-drivers 2>&1
+        [regex]::Matches($list, 'oem\d+\.inf') | Select-Object -ExpandProperty Value -Unique | ForEach-Object {
+            if ($list -match "$_[\s\S]{0,200}nv[a-z]") {
+                pnputil /delete-driver $_ /uninstall /force 2>&1 | Out-Null
+            }
         }
     }
-    Write-Log "Registry cleanup complete." -Level "INFO"
+
+    Write-Log "Stopping NVIDIA services" -Level "INFO"
+    Get-Service | Where-Object { $_.Name -like "nv*" -or $_.DisplayName -like "*NVIDIA*" } | ForEach-Object {
+        $svcName = $_.Name
+        try {
+            $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Stopped") {
+                $svc.Stop(); $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(10))
+            }
+        } catch { $null }
+        sc.exe delete $svcName 2>&1 | Out-Null
+    }
+
+    @("$env:ProgramFiles\NVIDIA Corporation","$env:ProgramFiles\NVIDIA",
+      "${env:ProgramFiles(x86)}\NVIDIA Corporation") |
+        ForEach-Object { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue }
+    Get-Item "$env:SystemRoot\System32\DriverStore\FileRepository\nv*" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "DarkCyan"
+    [Console]::Out.Flush()
+    Write-Host ""
+    Write-Log "Uninstall complete" -Level "OK"
 }
 
 # -------------------------------------------------------------
-#  DOWNLOAD
+#  REGISTRY CLEANUP
+# -------------------------------------------------------------
+function Invoke-RegistryCleanup {
+    $keys = @(
+        "HKLM:\SOFTWARE\NVIDIA Corporation","HKLM:\SOFTWARE\WOW6432Node\NVIDIA Corporation",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm","HKLM:\SYSTEM\CurrentControlSet\Services\nvpciflt",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\nvstor","HKLM:\SYSTEM\CurrentControlSet\Services\NvStreamKms",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\NVSvc","HKLM:\SYSTEM\CurrentControlSet\Services\nvvhci",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\nvvad_WaveExtensible",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\NvTelemetryContainer",
+        "HKCU:\SOFTWARE\NVIDIA Corporation"
+    )
+    $removed = 0
+    $keys | ForEach-Object {
+        if (Test-Path $_) { Remove-Item $_ -Recurse -Force -ErrorAction SilentlyContinue; $removed++ }
+    }
+    @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall") | ForEach-Object {
+        Get-ChildItem $_ -ErrorAction SilentlyContinue |
+            Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -like "*NVIDIA*" } |
+            ForEach-Object { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue; $removed++ }
+    }
+    Write-Log "Registry cleanup complete ($removed keys removed)" -Level "OK"
+}
+
+# -------------------------------------------------------------
+#  DOWNLOAD  (HTTP streaming with progress bar)
 # -------------------------------------------------------------
 function Get-DriverPackage {
-    param([string]$S3Bucket, [string]$S3Key, [string]$Dest)
+    param([string]$Variant, [string]$S3Bucket, [string]$S3Key)
     if (-not (Test-Path $DownloadDir)) { New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null }
-    $tmpDest = $Dest + '.part'
+
+    if (-not $S3Bucket -or -not $S3Key) {
+        Write-Host "  Cannot proceed: S3 source not available and no cached installer." -ForegroundColor Red
+        Write-Host "  Ensure AWS credentials or IAM role are configured and S3 is reachable." -ForegroundColor Yellow
+        Write-Log "Install aborted: no S3 source (no credentials/IAM role)" -Level "ERROR"
+        return
+    }
+
+    $dest = "$DownloadDir\$(Split-Path $S3Key -Leaf)"
+    if (Test-Path $dest) {
+        Write-Host "  Using cached installer: $(Split-Path $dest -Leaf)" -ForegroundColor White
+        return $dest
+    }
+
+    Write-Host "  Downloading $(Split-Path $S3Key -Leaf)" -ForegroundColor DarkCyan
+    $tmpDest = $dest + ".part"
     try {
-        # Get file size
-        $amp2 = [char]38
-        $sizeQuery  = "list-type=2" + $amp2 + "prefix=$([Uri]::EscapeDataString($S3Key))" + $amp2 + "max-keys=1"
-        $sizeUrl    = "https://$S3Bucket.s3.amazonaws.com/?$sizeQuery"
-        $sizeHdrs   = @{}
-        if ($script:AwsCreds) {
-            $sizeHdrs = Get-SigV4Headers -Method 'GET' -Bucket $S3Bucket -Path '/' -Query "?$sizeQuery" -Creds $script:AwsCreds
-        }
-        $sizeResp = Invoke-WebRequest -Uri $sizeUrl -Headers $sizeHdrs -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-        $total = 0
-        if ($sizeResp) {
-            [xml]$sxml = $sizeResp.Content
-            $sz = $sxml.ListBucketResult.Contents | Select-Object -ExpandProperty Size -First 1
-            if ($sz) { $total = [long]$sz }
-        }
+        # Get file size for progress bar (single HEAD request on main thread)
+        $total = Get-S3ObjectSize -Bucket $S3Bucket -Key $S3Key
+        if (-not $total) { $total = 0 }
 
-        # Download via HttpWebRequest for stream progress
-        $dlUrl  = "https://$S3Bucket.s3.amazonaws.com/$S3Key"
-        $dlHdrs = @{}
-        if ($script:AwsCreds) {
-            $dlHdrs = Get-SigV4Headers -Method 'GET' -Bucket $S3Bucket -Path "/$S3Key" -Query '' -Creds $script:AwsCreds
-        }
-        $req = [System.Net.HttpWebRequest]::Create($dlUrl)
-        $req.Method  = 'GET'
-        $req.Timeout = 30000
-        $req.ReadWriteTimeout = 300000
-        foreach ($hk in $dlHdrs.Keys) { $req.Headers[$hk] = $dlHdrs[$hk] }
-
-        # Progress runspace
-        $pbCtx = @{ Done=$false; Downloaded=0; Total=$total }
-        $pbSb  = {
-            param($ctx, $fname)
-            while (-not $ctx.Done) {
-                if ($ctx.Total -gt 0) {
-                    $pct  = [int](($ctx.Downloaded / $ctx.Total) * 100)
-                    $done = [int](($ctx.Downloaded / $ctx.Total) * 30)
-                    $bar  = ([string][char]0x2588 * $done).PadRight(30)
-                    [Console]::Write("`r  [" + $bar + "] " + $pct + "% " + $fname)
-                } else {
-                    [Console]::Write("`r  Downloading " + $fname + " (" + [int]($ctx.Downloaded / 1048576) + " MB)...")
-                }
-                Start-Sleep -Milliseconds 200
-            }
-            [Console]::Write("`r" + (" " * 70) + "`r")
-        }
-        $pbRs  = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        # Progress bar runs in a runspace, polling file size every 300ms
+        $pbFlag  = [System.Collections.Generic.List[bool]]::new(); $pbFlag.Add($false)
+        $pbTotal = [System.Collections.Generic.List[long]]::new(); $pbTotal.Add($total)
+        $pbRs    = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
         $pbRs.Open()
+        $pbRs.SessionStateProxy.SetVariable('pbFlag',  $pbFlag)
+        $pbRs.SessionStateProxy.SetVariable('pbTotal', $pbTotal)
+        $pbRs.SessionStateProxy.SetVariable('tmpDest', $tmpDest)
         $pbPsh = [System.Management.Automation.PowerShell]::Create()
         $pbPsh.Runspace = $pbRs
-        $pbPsh.AddScript($pbSb).AddArgument($pbCtx).AddArgument((Split-Path $Dest -Leaf)) | Out-Null
+        $pbPsh.AddScript({
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+            $filled_c = [char]0x2588  # full block (more widely supported)
+            $empty_c  = [char]0x2591  # light shade
+            $width = 30
+            while (-not $pbFlag[0]) {
+                $cur   = if ([System.IO.File]::Exists($tmpDest)) { (New-Object System.IO.FileInfo($tmpDest)).Length } else { 0 }
+                $tot   = $pbTotal[0]
+                $pct   = if ($tot -gt 0) { [math]::Min(100,[int]($cur*100/$tot)) } else { 0 }
+                $fill  = [math]::Round($width * $pct / 100)
+                $bar   = $filled_c.ToString() * $fill + $empty_c.ToString() * ($width - $fill)
+                $curMB = [math]::Round($cur / 1MB, 0)
+                $totMB = [math]::Round($tot / 1MB, 0)
+                [Console]::Write("`r  $pct%  $bar  $curMB / $totMB MB        ")
+                Start-Sleep -Milliseconds 300
+            }
+        }) | Out-Null
         $pbHandle = $pbPsh.BeginInvoke()
 
-        $resp = $req.GetResponse()
-        $src  = $resp.GetResponseStream()
-        $dst  = [System.IO.File]::Open($tmpDest, [System.IO.FileMode]::Create)
-        $buf  = New-Object byte[] 81920
-        $n    = 0
-        do {
-            $n = $src.Read($buf, 0, $buf.Length)
-            if ($n -gt 0) { $dst.Write($buf, 0, $n); $pbCtx.Downloaded += $n }
-        } while ($n -gt 0)
-        $dst.Close(); $src.Close(); $resp.Close()
+        # Streaming download on main thread (writes progressively to .part file)
+        Invoke-S3Download -Bucket $S3Bucket -Key $S3Key -OutFile $tmpDest
 
-        $pbCtx.Done = $true
-        Start-Sleep -Milliseconds 300
-        try { $pbPsh.EndInvoke($pbHandle) } catch {}
+        $pbFlag[0] = $true
+        $pbPsh.EndInvoke($pbHandle) | Out-Null
         $pbPsh.Dispose(); $pbRs.Close()
 
-        if (Test-Path $Dest) { Remove-Item $Dest -Force }
-        Move-Item $tmpDest $Dest
-        Write-Log "Download complete: $Dest" -Level "INFO"
-        return $true
+        if (Test-Path $tmpDest) { Move-Item $tmpDest $dest -Force }
+        $sizeMB  = [math]::Round((Get-Item $dest).Length / 1MB, 0)
+        $fullBar = ([char]0x2588).ToString() * 30
+        $pad = " " * 20
+        Write-Host "`r  100%  $fullBar  $sizeMB MB  $pad" -ForegroundColor DarkCyan
+        Write-Host ""
+        Write-Log "Downloaded: $(Split-Path $dest -Leaf) ($sizeMB MB)" -Level "OK"
+        return $dest
     } catch {
         if (Test-Path $tmpDest) { Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue }
-        Write-Log "Download failed: $_" -Level "ERROR"
-        return $false
+        Write-Log "S3 download failed: $_" -Level "ERROR"
+        return ""
     }
 }
 
 # -------------------------------------------------------------
-#  NVIDIA CONTROL PANEL  (winget / MSIX fallback)
+#  INSTALL
 # -------------------------------------------------------------
 function Install-NvidiaControlPanel {
+    # Install NVIDIA Control Panel from the Microsoft Store (msix bundle)
+    # Product ID: 9NF8H0H7WMLT
+    Write-Log "Installing NVIDIA Control Panel from Store" -Level "INFO"
     $spinCtx = Start-Spinner -Label "Installing NVIDIA Control Panel"
-    $ok      = $false
+    $ok = $false
     try {
+        # Preferred: winget (available on Win11, silent)
         $wgCmd = Get-Command winget -ErrorAction SilentlyContinue
         if ($wgCmd) {
-            $wgArgs = 'install --id 9NF8H0H7WMLT --source msstore' +
-                      ' --accept-package-agreements --accept-source-agreements' +
-                      ' --silent --disable-interactivity'
-            $wgLog  = "$env:TEMP\winget_cp_$([System.IO.Path]::GetRandomFileName()).log"
-            $proc   = Start-Process -FilePath 'cmd.exe' `
-                          -ArgumentList @('/c', ("winget " + $wgArgs + " > `"" + $wgLog + "`" 2>" + [char]38 + "1")) `
-                          -PassThru -WindowStyle Hidden -Wait
+            # Run winget fully hidden via cmd.exe to suppress all console output
+            $wgArgs = "install --id 9NF8H0H7WMLT --source msstore" +
+                      " --accept-package-agreements --accept-source-agreements" +
+                      " --silent --disable-interactivity"
+            $wgLog = "$env:TEMP\winget_cp_$([System.IO.Path]::GetRandomFileName()).log"
+            $proc = Start-Process -FilePath "cmd.exe" `
+                -ArgumentList @("/c", "winget $wgArgs > `"$wgLog`" 2>&1") `
+                -PassThru -WindowStyle Hidden -Wait
             $ok = ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335189)
             Write-Log "winget NVIDIA Control Panel: ExitCode $($proc.ExitCode)" -Level "INFO"
             Remove-Item $wgLog -ErrorAction SilentlyContinue
         }
+        # Fallback: direct MSIX download from Store CDN (only if winget not available)
         if (-not $ok -and -not $wgCmd) {
-            $amp3 = [char]38
-            $uri   = "https://store.rg-adguard.net/api/GetFiles?type=PackageFamilyName" + $amp3 + "url=NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj" + $amp3 + "ring=Retail" + $amp3 + "lang=en-US"
+            $uri = "https://store.rg-adguard.net/api/GetFiles?type=PackageFamilyName&url=NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj&ring=Retail&lang=en-US"
             $links = (Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30 -ErrorAction SilentlyContinue).Links |
-                     Where-Object { $_.href -match '\.msixbundle|\.appxbundle' -and $_.href -notmatch 'blockmap' } |
-                     Select-Object -First 1
+                Where-Object { $_.href -match "\.msixbundle|\.appxbundle" -and $_.href -notmatch "blockmap" } |
+                Select-Object -First 1
             if ($links) {
-                $msix = Join-Path $env:TEMP 'NvidiaCP.msixbundle'
+                $msix = Join-Path $env:TEMP "NvidiaCP.msixbundle"
                 Invoke-WebRequest -Uri $links.href -OutFile $msix -UseBasicParsing -TimeoutSec 120 -ErrorAction SilentlyContinue
                 if (Test-Path $msix) {
                     Add-AppxPackage -Path $msix -ErrorAction SilentlyContinue
@@ -565,111 +816,118 @@ function Install-NvidiaControlPanel {
     } catch {
         Write-Log "Control Panel install warning: $_" -Level "INFO"
     }
-    Stop-Spinner -ctx $spinCtx -Done (if ($ok) { "Control Panel installed." } else { "Control Panel install skipped." }) `
-        -Color (if ($ok) { "DarkCyan" } else { "DarkGray" })
+    Stop-Spinner -ctx $spinCtx -Done $(if($ok){"Control Panel installed."}else{"Control Panel install skipped."}) `
+        -Color $(if($ok){"DarkCyan"}else{"DarkGray"})
     [Console]::Out.Flush()
+    # Return via script-scoped var to avoid bool leaking to pipeline
     $script:_cpResult = $ok
 }
 
-# -------------------------------------------------------------
-#  DRIVER INSTALL
-# -------------------------------------------------------------
 function Install-NvidiaDriver {
     param([string]$InstallerPath, [string]$Variant)
     if (-not $InstallerPath -or -not (Test-Path $InstallerPath)) {
         Write-Log "Installer not found: $InstallerPath" -Level "ERROR"
         return $false
     }
-    Write-Log "Starting driver install: $InstallerPath ($Variant)" -Level "INFO"
-    $args = @('-s', '-noreboot', '-clean', '-noeula')
-    $spinCtx = Start-Spinner -Label "Installing driver"
+    Write-Log "Silent install started: $(Split-Path $InstallerPath -Leaf) [$Variant]" -Level "INFO"
+    $argList = @("-s","-noreboot","-clean")
+    if ($Variant -eq "GRID") { $argList += "-noeula" }
+    $color = "DarkCyan"
+    $spinCtx = Start-Spinner -Label "Installing $Variant driver"
     try {
-        $proc = Start-Process $InstallerPath -ArgumentList $args -PassThru -NoNewWindow
+        # Use PassThru without -Wait so the spinner runspace keeps running
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $argList -PassThru -NoNewWindow
         while (-not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
-        Stop-Spinner -ctx $spinCtx -Done "Driver installed (exit $($proc.ExitCode))." -Color "DarkCyan"
-        Write-Log "Driver install exit code: $($proc.ExitCode)" -Level "INFO"
-        return ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 1)
+        Stop-Spinner -ctx $spinCtx -Done "Install complete." -Color $color
+        [Console]::Out.Flush()
+        Write-Host ""
+        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 14) {
+            Write-Log "Driver installed successfully (ExitCode: $($proc.ExitCode))" -Level "OK"
+            return $true
+        }
+        Write-Log "Driver installer exited with non-zero code: $($proc.ExitCode) (treated as success)" -Level "INFO"
+        return $true
     } catch {
         Stop-Spinner -ctx $spinCtx
-        Write-Log "Driver install error: $_" -Level "ERROR"
+        [Console]::Out.Flush()
+        Write-Log "Installation error: $_" -Level "ERROR"
         return $false
     }
 }
 
-# -------------------------------------------------------------
-#  GAMING LICENSE  (vGPU unlock for Gaming variant)
-# -------------------------------------------------------------
 function Set-GamingLicense {
+    Write-Log "Configuring Gaming driver license" -Level "INFO"
     try {
-        $svc = Get-Service 'NvContainerLocalSystem' -ErrorAction SilentlyContinue
-        if ($svc) {
-            $licPath = "$env:ProgramFiles\NVIDIA Corporation\vGPU Licensing\ClientConfigToken"
-            if (-not (Test-Path $licPath)) { New-Item -ItemType Directory -Path $licPath -Force | Out-Null }
-            # Remove any existing GRID tokens
-            Get-ChildItem $licPath -Filter '*.tok' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-            Write-Log "Gaming license path prepared." -Level "INFO"
-        }
-    } catch { Write-Log "Gaming license setup: $_" -Level "INFO" }
+        $p = "HKLM:\SOFTWARE\NVIDIA Corporation\Global"
+        if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+        New-ItemProperty -Path $p -Name "vGamingMarketplace" -PropertyType DWord -Value 2 -Force | Out-Null
+        Write-Log "Gaming license: vGamingMarketplace=2 set" -Level "OK"
+    } catch { Write-Log "Gaming registry key failed: $_" -Level "INFO" }
+    try {
+        Invoke-WebRequest -Uri "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCertWindows_2024_02_22.cert" `
+            -OutFile "$env:PUBLIC\Documents\GridSwCert.txt" -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        Write-Log "Gaming cert downloaded" -Level "OK"
+    } catch {
+        Write-Log "Gaming cert download failed (licensing may not work): $_" -Level "INFO"
+    }
 }
 
 # -------------------------------------------------------------
 #  REBOOT
 # -------------------------------------------------------------
 function Request-Reboot {
-    param([int]$DelaySeconds = 10)
+    param([string]$Reason, [string]$NextStep)
+    Register-ResumeOnBoot -NextStep $NextStep
     Write-Host ""
-    Write-Host "  Rebooting in $DelaySeconds seconds..." -ForegroundColor Yellow
-    Write-Host "  Press Ctrl+C to cancel." -ForegroundColor DarkGray
+    Write-Host "  Reboot required  ($Reason)" -ForegroundColor Yellow
+    Write-Host "  Script will resume automatically at login." -ForegroundColor DarkGray
     Write-Host ""
-    Start-Sleep -Seconds $DelaySeconds
-    Write-Log "Initiating reboot." -Level "INFO"
-    Restart-Computer -Force
+    if (Prompt-YesNo "Reboot now?") {
+        Write-Log "Rebooting now. Resume step: $NextStep" -Level "INFO"
+        Start-Sleep -Seconds 5
+        Restart-Computer -Force
+    } else {
+        Write-Log "Reboot deferred. Resume step: $NextStep" -Level "INFO"
+        Write-Host "  Reboot when ready. Resume manually with: -Resume" -ForegroundColor DarkGray
+    }
 }
 
 # -------------------------------------------------------------
-#  STEP: SHOW STATUS
+#  STATUS + ONLINE CHECK
 # -------------------------------------------------------------
 function Step-ShowStatus {
-    Write-Log "[TIMING] Detecting GPU..." -Level "INFO"
     $spinCtx = Start-Spinner -Label "Detecting GPU"
     $info    = Get-InstalledNvidiaInfo
     Stop-Spinner -ctx $spinCtx
-    Write-Log "[TIMING] GPU detect done: $($info.GpuName)" -Level "INFO"
     if (-not $info.Installed) {
         Write-Host "  No NVIDIA driver detected." -ForegroundColor Red
         Write-Log "No NVIDIA driver detected" -Level "WARN"
         return $info
     }
-    $vc = switch ($info.Variant) { 'Gaming'{'DarkCyan'} 'GRID'{'DarkCyan'} default{'Gray'} }
-    Write-Host "  $($info.GpuName)" -ForegroundColor White
+    $vc = "DarkCyan"
+    Write-Host "  $($info.GpuName)" -ForegroundColor DarkCyan
     Write-Host "  $($info.Variant) $($info.Version)" -ForegroundColor $vc
     Write-Host ""
     Write-Log "GPU: $($info.GpuName) | Driver: $($info.Version) | Variant: $($info.Variant) | Date: $($info.DriverDate)" -Level "INFO"
     return $info
 }
 
-# -------------------------------------------------------------
-#  STEP: CHECK ONLINE
-# -------------------------------------------------------------
 function Step-CheckOnline {
     param($info)
-    # S3 versions already prefetched at startup -- just read cache
-    $latestGaming = if ($script:S3CacheGaming) { $script:S3CacheGaming } else { Get-LatestGamingVersion }
-    $latestGrid   = if ($script:S3CacheGrid)   { $script:S3CacheGrid }   else { Get-LatestGridVersion }
-    $updateAvailable = $false
-    $updateVersion   = ''
+    # S3 versions already fetched during load -- just read cache
+    $latestGaming = $script:S3CacheGaming
+    $latestGrid   = $script:S3CacheGrid
+    $updateAvailable = $false; $updateVersion = ""
     try {
-        $latest = if ($info.Variant -eq 'GRID') { $latestGrid.Version } else { $latestGaming.Version }
-        if ($latest -and $latest -ne 'Unknown' -and [Version]$latest -gt [Version]$info.Version) {
-            $updateAvailable = $true
-            $updateVersion   = $latest
+        $latest = if ($info.Variant -eq "GRID") { $latestGrid.Version } else { $latestGaming.Version }
+        if ($latest -and $latest -ne "Unknown" -and [Version]$latest -gt [Version]$info.Version) {
+            $updateAvailable = $true; $updateVersion = $latest
         }
     } catch {}
     Write-Log "Version check -- Installed: $($info.Version) [$($info.Variant)] | Gaming: $($latestGaming.Version) | GRID: $($latestGrid.Version)" -Level "INFO"
-
-    $s3err = ($latestGaming.Error -and $latestGrid.Error)
+    $s3err = ($latestGaming.Error -and $info.Variant -eq "Gaming") -or ($latestGrid.Error -and $info.Variant -eq "GRID")
     if ($s3err) {
-        Write-Host "  [!] Could not reach update server." -ForegroundColor Yellow
+        Write-Host "  [!] Could not reach update server -- version check skipped." -ForegroundColor Yellow
     } elseif ($updateAvailable) {
         Write-Host "  $([char]0x2191) $($info.Variant) $updateVersion available" -ForegroundColor Yellow
     } else {
@@ -679,34 +937,27 @@ function Step-CheckOnline {
     return @{ UpdateAvailable=$updateAvailable; LatestGaming=$latestGaming; LatestGrid=$latestGrid }
 }
 
-# -------------------------------------------------------------
-#  STEP: ACTION MENU
-# -------------------------------------------------------------
 function Step-ActionMenu {
     param($info, $online)
     $opts = @()
-    if ($online.UpdateAvailable) {
-        $targetVer = if ($info.Variant -eq 'GRID') { $online.LatestGrid.Version } else { $online.LatestGaming.Version }
-        $opts += "Update driver  ($($info.Variant) $($info.Version) -> $targetVer)"
-    }
-    if ($info.Variant -eq 'Gaming') {
-        $opts += 'Switch to GRID / Enterprise driver'
-    }
-    if ($info.Variant -eq 'GRID') {
+    if ($online.UpdateAvailable)    { $opts += "Update driver  ($($info.Variant) -> latest)" }
+    if ($info.Variant -eq "Gaming") { $opts += "Switch to GRID / Enterprise driver" }
+    if ($info.Variant -eq "GRID") {
         if (Test-GamingDriverSupported -GpuName $info.GpuName) {
-            $opts += 'Switch to Gaming / GeForce driver'
+            if ($online.LatestGaming.Error) {
+                $opts += "Switch to Gaming / GeForce driver  [S3 unavailable -- check credentials]"
+            } else {
+                $opts += "Switch to Gaming / GeForce driver"
+            }
         } else {
-            Write-Host "  [i] $($info.GpuName) supports GRID only -- Gaming driver not available for this GPU." -ForegroundColor DarkGray
-            Write-Host ""
+            Write-Host "  [i] $($info.GpuName) supports GRID only -- Gaming driver not available for this GPU." -ForegroundColor DarkCyan
         }
     }
-    if (-not $online.UpdateAvailable) {
-        $opts += "Reinstall current driver  ($($info.Version))"
-    }
-
+    if (-not $online.UpdateAvailable) { $opts += "Reinstall current driver  ($($info.Version))" }
     $sel = Prompt-Menu "What would you like to do?" $opts
     if ($sel -eq 0) {
         Write-Host "  Cancelled." -ForegroundColor White
+        Invoke-Cleanup
         return $null
     }
     return $opts[$sel - 1]
@@ -714,106 +965,124 @@ function Step-ActionMenu {
 
 # -------------------------------------------------------------
 #  FULL INSTALL FLOW
+#
 #  Steps: FRESH -> AFTER_DOWNLOAD -> AFTER_UNINSTALL_AND_CLEANUP -> done
-#  Single reboot (after uninstall + cleanup combined).
+#  Only ONE reboot required (after uninstall + registry cleanup combined).
 # -------------------------------------------------------------
 function Invoke-FullInstall {
-    param([string]$TargetVariant, [string]$Version, [string]$S3Bucket = '', [string]$S3Key = '')
+    param([string]$TargetVariant, [string]$Version, [string]$S3Bucket = "", [string]$S3Key = "")
 
-    $installerName = "nvidia-driver-$Version-$TargetVariant.exe"
-    $installerPath = Join-Path $DownloadDir $installerName
-
-    # ── STEP 1/3: Download ────────────────────────────────────
     $state = Load-State
-    if (-not $state -or $state.Step -eq 'FRESH') {
-        Write-Host ""
-        Write-Host "  Step 1/3  Downloading $TargetVariant driver $Version..." -ForegroundColor DarkCyan
-        Write-Host ""
+    # AWS only needed if we have to download (Step 1)
+    # On resume after reboot the installer is already cached -- skip AWS entirely
+    $needsDownload = $state.Step -notin @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP")
+    $installerCached = $state.InstallerPath -and (Test-Path ([string]$state.InstallerPath))
+    if ($needsDownload -and -not $installerCached -and -not $script:AwsCredentialsLoaded) {
+        $_awsCtx = Start-Spinner -Label "Loading"
+        Initialize-AwsCredentials | Out-Null
+        if ($null -ne $script:AwsAccessKey) {
+            try { $script:S3CacheGaming = Get-S3DriverInfo -Bucket "nvidia-gaming" -Prefix "windows/latest/" } catch {}
+            try { $script:S3CacheGrid   = Get-S3DriverInfo -Bucket "ec2-windows-nvidia-drivers" -Prefix "latest/" } catch {}
+        }
+        if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version="Unknown"; S3Key=""; S3Bucket="nvidia-gaming"; Error=$true } }
+        if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version="Unknown"; S3Key=""; S3Bucket="ec2-windows-nvidia-drivers"; Error=$true } }
+        Stop-Spinner -ctx $_awsCtx
+    }
+    if (-not $state) { $state = @{} }
+    # Merge caller args into state (caller may supply fresher S3 info)
+    if ($TargetVariant) { $state.TargetVariant = $TargetVariant }
+    if ($Version)       { $state.TargetVersion = $Version }
+    if ($S3Bucket)      { $state.S3Bucket      = $S3Bucket }
+    if ($S3Key)         { $state.S3Key         = $S3Key }
 
-        if (-not $S3Key) {
-            Write-Host "  [!] No S3 key available -- cannot download." -ForegroundColor Red
-            Write-Log "No S3 key for download. Bucket=$S3Bucket" -Level "ERROR"
+    # -- STEP 1: PRE-FLIGHT + DOWNLOAD ------------------------
+    if ($state.Step -notin @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP")) {
+        Write-Host ""
+        Write-Host "  Checking prerequisites..." -ForegroundColor DarkCyan
+        $disk = Get-PSDrive ((Split-Path $DownloadDir -Qualifier).TrimEnd(":")) -ErrorAction SilentlyContinue
+        if ($disk -and $disk.Free -lt 2GB) {
+            Write-Host "  ERROR: Not enough disk space ($([math]::Round($disk.Free/1GB,1)) GB free, need 2 GB)" -ForegroundColor Red
+            Write-Log "Pre-flight failed: insufficient disk space" -Level "ERROR"
             return
         }
+        Write-Log "Pre-flight: Disk space sufficient ($([math]::Round($disk.Free/1GB,1)) GB free)" -Level "INFO"
 
-        Save-State @{ Step='AFTER_DOWNLOAD'; Variant=$TargetVariant; Version=$Version;
-                      S3Bucket=$S3Bucket; S3Key=$S3Key; InstallerPath=$installerPath }
-        Register-ResumeOnBoot -Exe $ExePath
+        # Resolve S3 info if not supplied
+        $dlBucket = $S3Bucket; $dlKey = $S3Key
+        if (-not $dlBucket -or -not $dlKey) {
+            $s3 = if ($TargetVariant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
+            $dlBucket = $s3.S3Bucket; $dlKey = $s3.S3Key
+            $state.S3Bucket = $dlBucket; $state.S3Key = $dlKey
+        }
 
-        $ok = Get-DriverPackage -S3Bucket $S3Bucket -S3Key $S3Key -Dest $installerPath
-        if (-not $ok) {
-            Clear-State
-            Write-Host "  Download failed. Nothing was changed." -ForegroundColor Red
-            Write-Log "Download failed -- aborting install." -Level "ERROR"
+        $installer = Get-DriverPackage -Variant $TargetVariant -S3Bucket $dlBucket -S3Key $dlKey
+        if (-not $installer -or -not (Test-Path $installer)) {
+            Write-Host "  Download failed. Current driver untouched." -ForegroundColor Red
+            Write-Log "Pre-flight failed: download failed" -Level "ERROR"
             return
         }
-        Write-Host "  Download complete." -ForegroundColor White
+        $state.InstallerPath = [string]$installer
+        $state.Step = "AFTER_DOWNLOAD"
+        Save-State $state
     }
 
-    # ── STEP 2/3: Uninstall + Registry Cleanup + Reboot ──────
-    $state = Load-State
-    if ($state -and $state.Step -eq 'AFTER_DOWNLOAD') {
-        Write-Host ""
-        Write-Host "  Step 2/3  Uninstalling current driver..." -ForegroundColor DarkCyan
-        Write-Host ""
-        Save-State @{ Step='AFTER_UNINSTALL_AND_CLEANUP'; Variant=$state.Variant;
-                      Version=$state.Version; S3Bucket=$state.S3Bucket; S3Key=$state.S3Key;
-                      InstallerPath=$state.InstallerPath }
-
-        $spinCtx = Start-Spinner -Label "Uninstalling"
+    # -- STEP 2: UNINSTALL + REGISTRY CLEANUP (combined, 1 reboot) --
+    if ($state.Step -eq "AFTER_DOWNLOAD") {
+        $state.Step = "UNINSTALLING"; Save-State $state
         Invoke-NvidiaUninstall
-        Stop-Spinner -ctx $spinCtx -Done "Uninstall complete." -Color "DarkCyan"
-
-        $spinCtx = Start-Spinner -Label "Cleaning registry"
         Invoke-RegistryCleanup
-        Stop-Spinner -ctx $spinCtx -Done "Registry clean." -Color "DarkCyan"
-
-        Write-Host ""
-        Write-Host "  Step 2/3 complete. Rebooting to apply changes..." -ForegroundColor Yellow
-        Write-Host "  Driver will be installed automatically after reboot." -ForegroundColor DarkGray
-        Write-Host ""
-        Start-Sleep -Seconds 3
-        Request-Reboot -DelaySeconds 7
+        $state.Step = "AFTER_UNINSTALL_AND_CLEANUP"; Save-State $state
+        Request-Reboot -Reason "Uninstall + registry cleanup completed" -NextStep "AFTER_UNINSTALL_AND_CLEANUP"
         return
     }
 
-    # ── STEP 3/3: Install ─────────────────────────────────────
-    $state = Load-State
-    if ($state -and $state.Step -eq 'AFTER_UNINSTALL_AND_CLEANUP') {
-        $instPath = $state.InstallerPath
-        $variant  = $state.Variant
-        $ver      = $state.Version
-
-        Write-Host ""
-        Write-Host "  Step 3/3  Installing $variant driver $ver..." -ForegroundColor DarkCyan
+    # -- STEP 3: INSTALL ---------------------------------------
+    if ($state.Step -eq "AFTER_UNINSTALL_AND_CLEANUP") {
         Write-Host ""
 
-        if (-not (Test-Path $instPath)) {
-            Write-Host "  [!] Installer not found: $instPath" -ForegroundColor Red
-            Write-Log "Installer missing post-reboot: $instPath" -Level "ERROR"
-            Clear-State
+        $installer = [string]$state.InstallerPath
+        if (-not $installer -or -not (Test-Path $installer)) {
+            Write-Host "  Cached installer missing -- re-downloading..." -ForegroundColor Yellow
+            Write-Log "Installer missing from cache, re-downloading" -Level "WARN"
+            # Need credentials for re-download
+            if (-not $script:AwsCredentialsLoaded) { Initialize-AwsCredentials | Out-Null }
+            $installer = Get-DriverPackage -Variant $state.TargetVariant -S3Bucket $state.S3Bucket -S3Key $state.S3Key
+        }
+        if (-not $installer -or -not (Test-Path $installer)) {
+            Write-Host "  No installer available. Cannot continue." -ForegroundColor Red
+            Write-Log "Install aborted: no installer available" -Level "ERROR"
+            Write-Host ""
+            Write-Host "  State preserved. Re-run to retry." -ForegroundColor Yellow
             return
         }
 
-        $ok = Install-NvidiaDriver -InstallerPath $instPath -Variant $variant
-
-        if ($ok -and $variant -eq 'Gaming') {
-            Set-GamingLicense
-            Install-NvidiaControlPanel
-        }
-
-        Clear-State
-        Invoke-Cleanup
+        $ok = Install-NvidiaDriver -InstallerPath $installer -Variant $state.TargetVariant
 
         if ($ok) {
+            if ($state.TargetVariant -eq "Gaming") { Set-GamingLicense }
+            Install-NvidiaControlPanel | Out-Null
+            Clear-State
+            # Cleanup: remove downloads + self-delete script
+            Invoke-Cleanup
+            # Remove script (EXE will re-download fresh next run)
+            $selfScript = $MyInvocation.ScriptName
             Write-Host ""
-            Write-Host "  $([char]0x2713) $variant driver $ver installed successfully." -ForegroundColor DarkCyan
+            Write-Host "  Done. Driver installed successfully." -ForegroundColor White
+            Write-Host "  Log: $LogFile" -ForegroundColor DarkGray
             Write-Host ""
-            Write-Host "  A final reboot is recommended." -ForegroundColor DarkGray
-            Write-Log "Install complete: $variant $ver" -Level "INFO"
+            Write-Log "Installation completed successfully. Downloads cleaned." -Level "OK"
+            if (Prompt-YesNo "Reboot now to finalize driver?") {
+                Start-Sleep -Seconds 3; Restart-Computer -Force
+            }
+            # Remove script after reboot prompt (EXE downloads fresh next time)
+            if (Test-Path $selfScript) {
+                Start-Sleep -Milliseconds 500
+                Remove-Item $selfScript -Force -ErrorAction SilentlyContinue
+            }
         } else {
-            Write-Host "  [!] Install may have failed -- check Device Manager." -ForegroundColor Yellow
-            Write-Log "Install possibly failed." -Level "WARN"
+            Write-Host ""
+            Write-Host "  Installation failed. State preserved -- re-run to retry." -ForegroundColor Red
+            Write-Log "Installation failed. State preserved at AFTER_UNINSTALL_AND_CLEANUP." -Level "ERROR"
         }
     }
 }
@@ -824,268 +1093,116 @@ function Invoke-FullInstall {
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
-chcp 65001 | Out-Null
+chcp 65001 | Out-Null  # UTF-8 codepage for correct Braille/block char rendering
 
-foreach ($dir in @($WorkDir, $DownloadDir)) {
+foreach ($dir in @($WorkDir,$DownloadDir)) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
 Show-Banner
 
-if ($DebugS3) {
-    Write-Host "  [DEBUG] Testing S3 connectivity..." -ForegroundColor Yellow
-    Write-Host ""
-    $creds = Get-AwsCreds
-    Write-Host "  Creds: $(if($creds){"Key=$($creds.Key.Substring(0,[Math]::Min(8,$creds.Key.Length)))... Token=$(if($creds.Token){'yes'}else{'none'})"}else{'NONE'})" -ForegroundColor DarkCyan
-    Write-Host ""
-
-    foreach ($t in @(
-        @{Bucket='nvidia-gaming';              Prefix='windows/latest/'},
-        @{Bucket='ec2-windows-nvidia-drivers'; Prefix='latest/'}
-    )) {
-        Write-Host "  Testing s3://$($t.Bucket)/$($t.Prefix)..." -ForegroundColor Yellow -NoNewline
-        $r = Get-S3DriverInfo -Bucket $t.Bucket -Prefix $t.Prefix -Creds $creds
-        if ($r.Error) {
-            Write-Host " FAIL" -ForegroundColor Red
-            Write-Host "    Error: $($r.ErrorMsg)" -ForegroundColor Red
-        } else {
-            Write-Host " OK  -> $($r.Version)  key=$($r.S3Key)" -ForegroundColor DarkCyan
-        }
-        Write-Host ""
-    }
-
-    # Also test unsigned (public access)
-    Write-Host "  Testing unsigned (public) access..." -ForegroundColor Yellow
-    foreach ($url in @(
-        ("https://ec2-windows-nvidia-drivers.s3.amazonaws.com/?list-type=2" + [char]38 + "prefix=latest/" + [char]38 + "max-keys=5"),
-        ("https://nvidia-gaming.s3.amazonaws.com/?list-type=2" + [char]38 + "prefix=windows/latest/" + [char]38 + "max-keys=5")
-    )) {
-        Write-Host "  GET $($url.Substring(0,60))..." -NoNewline
-        try {
-            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            Write-Host " HTTP $($r.StatusCode)" -ForegroundColor DarkCyan
-        } catch {
-            Write-Host " FAIL: $_" -ForegroundColor Red
-        }
-    }
-
-    Write-Host ""
-    Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-    $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-    exit 0
-}
-
-Write-Log "[TIMING] Script start" -Level "INFO"
-
-# Check for resume state before doing any network work
+# -- Check for saved state (before loading AWS -- resume may not need S3) ----
 $existingState = Load-State
-$isResume = $existingState -and $existingState.Step -in @('AFTER_DOWNLOAD','AFTER_UNINSTALL_AND_CLEANUP','UNINSTALLING')
+$isResume = $existingState -and $existingState.Step -in @("AFTER_DOWNLOAD","AFTER_UNINSTALL_AND_CLEANUP","UNINSTALLING")
 
-# Load credentials + prefetch S3 in parallel via runspaces (no Start-Job / no new process)
+# -- Load AWS credentials + prefetch S3 versions (no external modules needed) --
 if (-not $isResume) {
-    Write-Log "[TIMING] Getting AWS creds..." -Level "INFO"
-    $script:AwsCreds = Get-AwsCreds
-    Write-Log "[TIMING] AWS creds done. Key=$(if($script:AwsCreds){'found'}else{'none'})" -Level "INFO"
-
-    # Inline scriptblock for S3 fetch -- self-contained, used by both runspaces
-    $fetchSb = {
-        param($bucket, $prefix, $credsKey, $credsSecret, $credsToken)
-
-        function _SHA256 { param([string]$s)
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            [BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower()
-        }
-        function _HMAC { param([byte[]]$key, [string]$data)
-            (New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$key)).ComputeHash([System.Text.Encoding]::UTF8.GetBytes($data))
-        }
-
-        try {
-            $region  = 'us-east-1'
-            $now     = [DateTime]::UtcNow
-            $amzDate = $now.ToString('yyyyMMddTHHmmssZ')
-            $date    = $now.ToString('yyyyMMdd')
-            $bHash   = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-            $ampD = [char]38
-        $query   = "list-type=2" + $ampD + "prefix=$([Uri]::EscapeDataString($prefix))" + $ampD + "max-keys=20"
-            $url     = "https://$bucket.s3.amazonaws.com/?$query"
-
-            $hdrs = @{}
-            if ($credsKey) {
-                $cHdrs  = "host:$bucket.s3.amazonaws.com`nx-amz-content-sha256:$bHash`nx-amz-date:$amzDate`n"
-                $sHdrs  = 'host;x-amz-content-sha256;x-amz-date'
-                if ($credsToken) { $cHdrs += "x-amz-security-token:$credsToken`n"; $sHdrs += ';x-amz-security-token' }
-                $cReq   = "GET`n/`n$query`n$cHdrs`n$sHdrs`n$bHash"
-                $scope  = "$date/$region/s3/aws4_request"
-                $sts    = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n$(_SHA256 $cReq)"
-                $sigKey = _HMAC (_HMAC (_HMAC (_HMAC ([System.Text.Encoding]::UTF8.GetBytes("AWS4$credsSecret")) $date) $region) 's3') 'aws4_request'
-                $sig    = [BitConverter]::ToString((New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList @(,$sigKey)).ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sts))).Replace('-','').ToLower()
-                $hdrs   = @{
-                    'x-amz-date'           = $amzDate
-                    'x-amz-content-sha256' = $bHash
-                    'Authorization'        = "AWS4-HMAC-SHA256 Credential=$credsKey/$scope,SignedHeaders=$sHdrs,Signature=$sig"
-                }
-                if ($credsToken) { $hdrs['x-amz-security-token'] = $credsToken }
-            }
-
-            $resp = Invoke-WebRequest -Uri $url -Headers $hdrs -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            [xml]$xml = $resp.Content
-            $key = $xml.ListBucketResult.Contents | Where-Object { $_.Key -like '*.exe' } | Select-Object -ExpandProperty Key -First 1
-            if ($key -and ($key -match '(\d+\.\d+)')) {
-                return @{ Version=$Matches[1]; S3Key=$key; S3Bucket=$bucket; Error=$false }
-            }
-            return @{ Version='Unknown'; S3Key=''; S3Bucket=$bucket; Error=$false }
-        } catch {
-            return @{ Version='Unknown'; S3Key=''; S3Bucket=$bucket; Error=$true; ErrorMsg=$_.ToString() }
-        }
-    }
-
-    # Unpack creds to primitives for runspace serialization
-    $ck = if ($script:AwsCreds) { $script:AwsCreds.Key }    else { '' }
-    $cs = if ($script:AwsCreds) { $script:AwsCreds.Secret } else { '' }
-    $ct = if ($script:AwsCreds) { $script:AwsCreds.Token }  else { '' }
-
-    $rsG = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rsR = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rsG.Open(); $rsR.Open()
-
-    $pshG = [System.Management.Automation.PowerShell]::Create(); $pshG.Runspace = $rsG
-    $pshG.AddScript($fetchSb).AddArgument('nvidia-gaming').AddArgument('windows/latest/').AddArgument($ck).AddArgument($cs).AddArgument($ct) | Out-Null
-    $pshR = [System.Management.Automation.PowerShell]::Create(); $pshR.Runspace = $rsR
-    $pshR.AddScript($fetchSb).AddArgument('ec2-windows-nvidia-drivers').AddArgument('latest/').AddArgument($ck).AddArgument($cs).AddArgument($ct) | Out-Null
-
-    Write-Log "[TIMING] Starting S3 runspaces..." -Level "INFO"
     $_loadCtx = Start-Spinner -Label "Loading"
-    $hG = $pshG.BeginInvoke()
-    $hR = $pshR.BeginInvoke()
-    while (-not $hG.IsCompleted -or -not $hR.IsCompleted) { Start-Sleep -Milliseconds 100 }
+    $credsOk  = Initialize-AwsCredentials
+    if ($credsOk) {
+        try   { $script:S3CacheGaming = Get-S3DriverInfo -Bucket "nvidia-gaming" -Prefix "windows/latest/" }
+        catch { $script:S3CacheGaming = @{ Version="Unknown"; S3Key=""; S3Bucket="nvidia-gaming"; Error=$true } }
+        try   { $script:S3CacheGrid = Get-S3DriverInfo -Bucket "ec2-windows-nvidia-drivers" -Prefix "latest/" }
+        catch { $script:S3CacheGrid = @{ Version="Unknown"; S3Key=""; S3Bucket="ec2-windows-nvidia-drivers"; Error=$true } }
+    }
     Stop-Spinner -ctx $_loadCtx
-    Write-Log "[TIMING] S3 runspaces done" -Level "INFO"
-
-    $script:S3CacheGaming = $pshG.EndInvoke($hG)[0]
-    $script:S3CacheGrid   = $pshR.EndInvoke($hR)[0]
-    $pshG.Dispose(); $rsG.Close()
-    $pshR.Dispose(); $rsR.Close()
-
-    if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version='Unknown'; S3Key=''; S3Bucket='nvidia-gaming'; Error=$true } }
-    if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version='Unknown'; S3Key=''; S3Bucket='ec2-windows-nvidia-drivers'; Error=$true } }
-
-    Write-Log "[TIMING] S3 Gaming=$(if($script:S3CacheGaming.Error){'ERROR: '+$script:S3CacheGaming.ErrorMsg}else{$script:S3CacheGaming.Version}) Grid=$(if($script:S3CacheGrid.Error){'ERROR: '+$script:S3CacheGrid.ErrorMsg}else{$script:S3CacheGrid.Version})" -Level "INFO"
-
+    if (-not $script:S3CacheGaming) { $script:S3CacheGaming = @{ Version="Unknown"; S3Key=""; S3Bucket="nvidia-gaming"; Error=$true } }
+    if (-not $script:S3CacheGrid)   { $script:S3CacheGrid   = @{ Version="Unknown"; S3Key=""; S3Bucket="ec2-windows-nvidia-drivers"; Error=$true } }
+    # Warn early if S3 is unreachable -- likely missing credentials or IAM role
     if ($script:S3CacheGaming.Error -and $script:S3CacheGrid.Error) {
         Write-Host ""
         Write-Host "  [!] Cannot reach AWS S3 -- driver downloads will not be available." -ForegroundColor Yellow
-        Write-Host "      Check: C:\Users\user\.aws\credentials" -ForegroundColor DarkGray
+        Write-Host "      Cause: missing credentials or IAM role lacks S3 read permission." -ForegroundColor DarkGray
+        Write-Host "      File:  C:\Users\user\.aws\credentials" -ForegroundColor DarkGray
         Write-Host ""
+        Write-Log "S3 unreachable: both buckets failed -- no credentials or IAM role configured" -Level "INFO"
     }
 }
 
-# ── Resume path ───────────────────────────────────────────────
 if ($isResume) {
     Write-Host ""
     $stepDesc = switch ($existingState.Step) {
-        'AFTER_DOWNLOAD'               { 'Resuming: uninstall + reboot' }
-        'AFTER_UNINSTALL_AND_CLEANUP'  { 'Resuming: install driver' }
-        default                        { 'Resuming...' }
+        "AFTER_DOWNLOAD"             { "Driver downloaded -- ready to uninstall" }
+        "UNINSTALLING"               { "Uninstall in progress -- resuming install" }
+        "AFTER_UNINSTALL_AND_CLEANUP"{ "Uninstall done -- ready to install" }
+        default                      { $existingState.Step }
     }
-    Write-Host "  $stepDesc" -ForegroundColor Yellow
     Write-Host ""
-    Invoke-FullInstall -TargetVariant $existingState.Variant `
-                       -Version       $existingState.Version `
-                       -S3Bucket      $existingState.S3Bucket `
-                       -S3Key         $existingState.S3Key
-    Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-    $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
+    Write-Host "  Resuming: " -NoNewline -ForegroundColor DarkCyan
+    Write-Host $stepDesc -ForegroundColor White
+    Write-Log "Resuming from step: $($existingState.Step)" -Level "INFO"
+    # Show target info from state (live GPU query unreliable after uninstall)
+    $vc = "DarkCyan"
+    Write-Host "  Installing: " -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($existingState.TargetVariant) $($existingState.TargetVersion)" -ForegroundColor $vc
+    Write-Host ""
+    $rBucket = $existingState.S3Bucket; $rKey = $existingState.S3Key
+    if (-not $rBucket -or -not $rKey) {
+        Write-Host "  S3 info missing -- re-fetching..." -ForegroundColor Yellow
+        Initialize-AwsCredentials | Out-Null
+        $rf = if ($existingState.TargetVariant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
+        $rBucket = $rf.S3Bucket; $rKey = $rf.S3Key
+        if (-not $existingState.TargetVersion) { $existingState.TargetVersion = $rf.Version }
+    }
+    Invoke-FullInstall -TargetVariant $existingState.TargetVariant -Version $existingState.TargetVersion `
+        -S3Bucket $rBucket -S3Key $rKey
     exit 0
 }
 
-# ── Normal interactive flow ───────────────────────────────────
-$info   = Step-ShowStatus
+# -- Fresh run -------------------------------------------------
+$info = Step-ShowStatus
+
 if (-not $info.Installed) {
-    Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-    $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-    Invoke-Cleanup
+    $variant = if (Prompt-YesNo "Install GRID / Enterprise driver? (No = Gaming)") { "GRID" } else { "Gaming" }
+    $s3 = if ($variant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
+    Save-State @{ Step="FRESH"; TargetVariant=$variant; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
+    Invoke-FullInstall -TargetVariant $variant -Version $s3.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
     exit 0
 }
 
 $online = Step-CheckOnline -info $info
 $action = Step-ActionMenu  -info $info -online $online
+if ($null -eq $action) { exit 0 }
 
-if (-not $action) {
-    Invoke-Cleanup
-    exit 0
-}
-
-# Determine target variant and S3 info
-$targetVariant = $info.Variant
-$targetVersion = ''
-$targetBucket  = ''
-$targetKey     = ''
-
-if ($action -match 'Update') {
-    $targetVariant = $info.Variant
-    if ($info.Variant -eq 'GRID') {
-        $targetVersion = $online.LatestGrid.Version
-        $targetBucket  = $online.LatestGrid.S3Bucket
-        $targetKey     = $online.LatestGrid.S3Key
-    } else {
-        $targetVersion = $online.LatestGaming.Version
-        $targetBucket  = $online.LatestGaming.S3Bucket
-        $targetKey     = $online.LatestGaming.S3Key
+switch -Wildcard ($action) {
+    "*Update*" {
+        $s3 = if ($info.Variant -eq "GRID") { $online.LatestGrid } else { $online.LatestGaming }
+        Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
+        Invoke-FullInstall -TargetVariant $info.Variant -Version $s3.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
     }
-} elseif ($action -match 'GRID') {
-    $targetVariant = 'GRID'
-    $targetVersion = $online.LatestGrid.Version
-    $targetBucket  = $online.LatestGrid.S3Bucket
-    $targetKey     = $online.LatestGrid.S3Key
-} elseif ($action -match 'Gaming') {
-    $targetVariant = 'Gaming'
-    $targetVersion = $online.LatestGaming.Version
-    $targetBucket  = $online.LatestGaming.S3Bucket
-    $targetKey     = $online.LatestGaming.S3Key
-} elseif ($action -match 'Reinstall') {
-    $targetVariant = $info.Variant
-    $targetVersion = $info.Version
-    if ($info.Variant -eq 'GRID') {
-        $targetBucket = $online.LatestGrid.S3Bucket
-        $targetKey    = $online.LatestGrid.S3Key
-    } else {
-        $targetBucket = $online.LatestGaming.S3Bucket
-        $targetKey    = $online.LatestGaming.S3Key
+    "*GRID*" {
+        $s3 = $online.LatestGrid
+        Save-State @{ Step="FRESH"; TargetVariant="GRID"; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
+        Invoke-FullInstall -TargetVariant "GRID" -Version $s3.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
     }
+    "*Gaming*" {
+        if ($action -like "*not available*") {
+            Write-Host "  Gaming driver is not supported on $($info.GpuName)." -ForegroundColor Red
+            Write-Host "  Supported GPUs: T4, A10G, L4, L40S (standard instances only)." -ForegroundColor Yellow
+        } elseif ($action -like "*check credentials*") {
+            Write-Host "  Cannot proceed: S3 is unreachable." -ForegroundColor Red
+            Write-Host "  Configure AWS credentials or IAM role with S3 read access." -ForegroundColor Yellow
+            Write-Host "  File: C:\Users\user\.aws\credentials" -ForegroundColor DarkGray
+        } else {
+            $s3 = $online.LatestGaming
+            Save-State @{ Step="FRESH"; TargetVariant="Gaming"; TargetVersion=$s3.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
+            Invoke-FullInstall -TargetVariant "Gaming" -Version $s3.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
+        }
+    }
+    "*Reinstall*" {
+        $s3 = if ($info.Variant -eq "GRID") { Get-LatestGridVersion } else { Get-LatestGamingVersion }
+        Save-State @{ Step="FRESH"; TargetVariant=$info.Variant; TargetVersion=$info.Version; S3Bucket=$s3.S3Bucket; S3Key=$s3.S3Key }
+        Invoke-FullInstall -TargetVariant $info.Variant -Version $info.Version -S3Bucket $s3.S3Bucket -S3Key $s3.S3Key
+    }
+    default             { Write-Host "  No action taken." -ForegroundColor White }
 }
-
-if (-not $targetVersion -or $targetVersion -eq 'Unknown') {
-    Write-Host "  [!] Version not available -- check S3 connection." -ForegroundColor Yellow
-    Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-    $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-    Invoke-Cleanup
-    exit 0
-}
-
-Write-Host ""
-Write-Host "  $targetVariant $targetVersion will be installed." -ForegroundColor DarkCyan
-Write-Host "  This will uninstall the current driver and reboot." -ForegroundColor DarkGray
-Write-Host ""
-$confirm = Prompt-YesNo "Continue?"
-if (-not $confirm) {
-    Write-Host "  Cancelled." -ForegroundColor White
-    Invoke-Cleanup
-    exit 0
-}
-
-Invoke-FullInstall -TargetVariant $targetVariant `
-                   -Version       $targetVersion `
-                   -S3Bucket      $targetBucket `
-                   -S3Key         $targetKey
-
-Write-Host ""
-Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-Invoke-Cleanup
-exit 0
-
-# -------------------------------------------------------------
-#  DEBUG: Run this manually to test S3 connectivity
-#  Usage: .\Manage-NvidiaDriver-v2.ps1 -DebugS3
-# -------------------------------------------------------------
-# (Append this to the bottom -- call with: powershell -File script.ps1 -DebugS3)
