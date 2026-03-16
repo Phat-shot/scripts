@@ -61,14 +61,37 @@ function Write-Log {
 function Get-FileFromWeb {
     param([string]$Url, [string]$Dest)
     Write-Log "Downloading $(Split-Path $Url -Leaf)..."
-    try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers['User-Agent'] = 'airgpu-vdd-installer/1.0'
-        $wc.DownloadFile($Url, $Dest)
-        Write-Log "  -> $Dest ($('{0:N1}' -f ((Get-Item $Dest).Length/1MB)) MB)"
-    } catch {
-        Write-Log "Download failed: $_" -Level 'ERROR'
-        throw
+    # Force TLS 1.2 -- required for GitHub and builds.parsec.app
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    $tmp = $Dest + '.part'
+    $ok  = $false
+    foreach ($attempt in 1..3) {
+        try {
+            $req                  = [System.Net.HttpWebRequest]::Create($Url)
+            $req.UserAgent        = 'airgpu-vdd-installer/1.0'
+            $req.Timeout          = 60000
+            $req.ReadWriteTimeout = 300000
+            $resp   = $req.GetResponse()
+            $stream = $resp.GetResponseStream()
+            $fs     = [System.IO.File]::Create($tmp)
+            $buf    = New-Object byte[] 65536
+            $read   = 0
+            while (($read = $stream.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $read) }
+            $fs.Close(); $stream.Close(); $resp.Close()
+            if (Test-Path $Dest) { Remove-Item $Dest -Force }
+            Rename-Item $tmp $Dest
+            Write-Log "  -> OK ($( '{0:N1}' -f ((Get-Item $Dest).Length / 1MB) ) MB)"
+            $ok = $true
+            break
+        } catch {
+            Write-Log "  Attempt $attempt failed: $_" -Level 'WARN'
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds (3 * $attempt)
+        }
+    }
+    if (-not $ok) {
+        Write-Log "All download attempts failed for $Url" -Level 'ERROR'
+        throw "Download failed: $Url"
     }
 }
 
