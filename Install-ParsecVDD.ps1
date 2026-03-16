@@ -87,8 +87,10 @@ function Get-GitHubAssetUrl {
     $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
     $json   = $reader.ReadToEnd()
     $reader.Close(); $resp.Close()
-    # Build regex pattern without [^ in quoted strings (PS parse-time issue)
-    $sq  = [char]34
+    # Build regex pattern without [^ in quoted strings (PS parse-time issue)
+
+    $sq  = [char]34
+
     $pat = "browser_download_url" + $sq + ":" + $sq + "(" + [char]91 + [char]94 + $sq + [char]93 + "+" + ")" + $sq
     $urls = [regex]::Matches($json, $pat) |
             ForEach-Object { $_.Groups[1].Value }
@@ -176,65 +178,38 @@ if (-not $vddInstalled) {
 # ── Step 3: Download and install always-connected service ───────────────────
 Write-Host '  [3/4] Setting up always-connected service...' -ForegroundColor DarkCyan
 
-# winsw
-$winswDest = Join-Path $WorkDir 'winsw.exe'
-$winswUrls = @(
-    'https://github.com/winsw/winsw/releases/download/v3.0.0-alpha.11/WinSW-x64.exe',
-    'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe'
-)
-$wsOk = $false
-foreach ($url in $winswUrls) {
-    try { Get-FileFromWeb -Url $url -Dest $winswDest; $wsOk = $true; break }
-    catch { Write-Log "  winsw URL failed: $url" -Level 'WARN' }
-}
-if (-not $wsOk) {
-    try {
-        $url = Get-GitHubAssetUrl -Repo 'winsw/winsw' -Pattern 'WinSW-x64\.exe$'
-        Get-FileFromWeb -Url $url -Dest $winswDest
-    } catch {
-        Write-Log "All winsw download sources failed." -Level 'ERROR'; throw
-    }
-}
-
-# ParsecVDA-Always-Connected
-$svcDest = Join-Path $WorkDir 'ParsecVDAAC.exe'
+# ParsecVDA-Always-Connected -- uses its own Inno Setup installer which registers
+# its own service internally. We run it with /SILENT so no wizard appears.
+$svcSetupDest = Join-Path $WorkDir 'ParsecVDAAC-setup.exe'
 try {
-    $url = Get-GitHubAssetUrl -Repo 'timminator/ParsecVDA-Always-Connected' -Pattern '\.exe$'
-    Get-FileFromWeb -Url $url -Dest $svcDest
+    $url = Get-GitHubAssetUrl -Repo 'timminator/ParsecVDA-Always-Connected' -Pattern 'setup.*x64\.exe$|x64.*setup\.exe$|\.exe$'
+    Get-FileFromWeb -Url $url -Dest $svcSetupDest
 } catch {
     Write-Log "ParsecVDA-Always-Connected download failed: $_" -Level 'ERROR'; throw
 }
 
-# Service XML
-$svcXml = Join-Path $WorkDir "$SvcName.xml"
-$xmlLines = @(
-    '<service>',
-    "  <id>$SvcName</id>",
-    '  <n>ParsecVDA - Always Connected</n>',
-    '  <description>Keeps a Parsec virtual display permanently connected for 4K gaming on EC2.</description>',
-    "  <executable>$svcDest</executable>",
-    '  <startmode>Automatic</startmode>',
-    '  <delayedAutoStart>true</delayedAutoStart>',
-    '  <log mode="none"/>',
-    '  <onfailure action="restart" delay="5 sec"/>',
-    '  <onfailure action="restart" delay="10 sec"/>',
-    '  <onfailure action="none"/>',
-    '</service>'
-)
-Set-Content -Path $svcXml -Value ($xmlLines -join "`r`n") -Encoding UTF8
-Write-Log "Service XML written."
+Write-Log "Running ParsecVDA-Always-Connected installer (silent) ..."
+$p = Start-Process -FilePath $svcSetupDest -ArgumentList '/SILENT', '/NORESTART' -PassThru -Wait
+Write-Log "Installer exit code: $($p.ExitCode)"
+if ($p.ExitCode -notin @(0, 3010)) {
+    Write-Log "Non-zero exit ($($p.ExitCode)) -- may still be OK." -Level 'WARN'
+}
+Start-Sleep -Seconds 5
 
-Write-Log "Installing + starting service ..."
-& $winswDest install $svcXml 2>&1 | ForEach-Object { Write-Log "  winsw: $_" }
-Start-Sleep -Seconds 1
-try { Start-Service -Name $SvcName -ErrorAction Stop }
-catch { sc.exe start $SvcName | Out-Null }
-Start-Sleep -Seconds 3
-
-$svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
-Write-Log "Service status: $($svc.Status)"
-if ($svc -and $svc.Status -ne 'Running') {
-    Write-Log "Service not running -- check Event Viewer for '$SvcName'." -Level 'WARN'
+# The installer registers its own service named "ParsecVDA - Always Connected"
+$realSvcName = 'ParsecVDA - Always Connected'
+$svc = Get-Service -Name $realSvcName -ErrorAction SilentlyContinue
+if ($svc) {
+    Write-Log "Service '$realSvcName' status: $($svc.Status)"
+    if ($svc.Status -ne 'Running') {
+        try { Start-Service -Name $realSvcName -ErrorAction Stop }
+        catch { sc.exe start $realSvcName | Out-Null }
+        Start-Sleep -Seconds 3
+        $svc = Get-Service -Name $realSvcName -ErrorAction SilentlyContinue
+        Write-Log "Service status after start: $($svc.Status)"
+    }
+} else {
+    Write-Log "Service '$realSvcName' not found after install -- check installer logs." -Level 'WARN'
 }
 
 # ── Step 4: Register preset resolutions ────────────────────────────────────
