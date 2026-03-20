@@ -163,12 +163,8 @@ if ($isResume) {
         # Install -- IDD only, no sessions, no firewall
         Write-Host '      Installing (silent)...' -ForegroundColor DarkGray
         $msiLog  = Join-Path $WorkDir 'dcv_msi.log'
-        $msiArgs = @(
-            '/i', $DcvMsiDest,
-            'DISABLE_AUTOMATIC_SESSION_CREATION=1',
-            '/quiet', '/norestart',
-            ('/l*v "' + $msiLog + '"')
-        )
+        # msiexec requires a single argument string -- array splitting breaks /l*v
+        $msiArgs = "/i `"$DcvMsiDest`" DISABLE_AUTOMATIC_SESSION_CREATION=1 /quiet /norestart /l*v `"$msiLog`""
         $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru -Wait
         Write-Log "msiexec exit: $($p.ExitCode)"
 
